@@ -4,6 +4,7 @@ import random
 import json
 import os
 import time
+from typing import Dict, List, Optional
 
 import numpy as np
 from  scipy.spatial.transform import Rotation
@@ -315,6 +316,60 @@ def _collect_eval_report(batch_data, loss, lddt_loss, plip_matched_edges):
         return {}
 
 
+def _compute_plip_consistency(data, threshold=0.5, dist_min=None, dist_max=None):
+    graphs = data if isinstance(data, list) else [data]
+    total = 0
+    tp = 0
+    pred_pos = 0
+    adjusted = 0
+    for g in graphs:
+        preds = getattr(g, 'cross_edge_predictions', None)
+        if preds is None or 'logits' not in preds:
+            continue
+        if not hasattr(g, 'plip_pair_to_index') or not hasattr(g, 'plip_interactions'):
+            continue
+        logits = preds['logits']
+        probs = torch.softmax(logits, dim=-1)
+        max_prob, pred_cls = probs.max(dim=-1)
+        edge_index = preds['edge_index']
+        pair_to_idx = g.plip_pair_to_index
+        interactions = g.plip_interactions
+        for idx, (lig, rec) in enumerate(zip(edge_index[0].tolist(), edge_index[1].tolist())):
+            key = (int(lig), int(rec))
+            if key not in pair_to_idx:
+                continue
+            total += 1
+            target = interactions['type'][pair_to_idx[key]].to(pred_cls.device)
+            if max_prob[idx] >= threshold:
+                pred_pos += 1
+                if pred_cls[idx] == target:
+                    tp += 1
+                if dist_min is not None or dist_max is not None:
+                    if 'geometry' in preds:
+                        geom = preds['geometry'][idx]
+                        if dist_min is not None:
+                            geom[0] = torch.maximum(geom[0], torch.tensor(dist_min, device=geom.device))
+                        if dist_max is not None:
+                            geom[0] = torch.minimum(geom[0], torch.tensor(dist_max, device=geom.device))
+                        adjusted += 1
+    precision = tp / pred_pos if pred_pos > 0 else 0.0
+    recall = tp / total if total > 0 else 0.0
+    return {
+        'plip_consistency_precision': float(precision),
+        'plip_consistency_recall': float(recall),
+        'plip_consistency_edges': int(total),
+        'plip_consistency_adjusted': int(adjusted),
+    }
+
+
+def _grad_norm(model) -> Optional[float]:
+    params = [p for p in model.parameters() if p.grad is not None]
+    if not params:
+        return None
+    norm = torch.norm(torch.stack([torch.norm(p.grad.detach()) for p in params]))
+    return float(norm.item())
+
+
 class AdaptiveStageScheduler:
     def __init__(self, stage_scales, min_batches=200, cooldown_batches=50, plateau_tol=0.002, exploration_prob=0.05, warmup_batches=5, ema_alpha=0.1):
         self.stage_scales = stage_scales
@@ -425,7 +480,8 @@ class AdaptiveStageScheduler:
 
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None, loss_clamp_value=None,
                 plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
-                stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None, log_perf=False):
+                stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None, log_perf=False,
+                plip_consistency_threshold=0.5, plip_postprocess_min=None, plip_postprocess_max=None):
     model.train()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'])
     skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0, 'singleton_batch': 0}
@@ -462,6 +518,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             loss = loss + plip_teacher_loss
             # with torch.autograd.detect_anomaly():
             loss.backward()
+            grad_norm = _grad_norm(model)
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
@@ -473,6 +530,11 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                        torch.tensor(float(plip_matched_edges))])
             if stage_scheduler is not None:
                 stage_scheduler.on_batch_end(loss.detach())
+            if plip_consistency_threshold is not None:
+                plip_stats = _compute_plip_consistency(data, threshold=plip_consistency_threshold, dist_min=plip_postprocess_min, dist_max=plip_postprocess_max)
+                for k, v in plip_stats.items():
+                    summary_val = meter.acc.get(k, torch.tensor(0.0))
+                    meter.acc[k] = summary_val + torch.tensor(v)
             train_loss += loss.item()
             train_num += 1
             bar.set_description('loss: %.4f' % (train_loss/train_num))
@@ -538,6 +600,15 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     if stage_scheduler is not None:
         summary['stage'] = stage_scheduler.stage
         summary['stage_scale'] = stage_scheduler.scale
+    if 'plip_consistency_precision' in meter.acc:
+        total_edges = meter.acc.get('plip_consistency_edges', torch.tensor(0.0)).item()
+        summary['plip_consistency_edges'] = total_edges
+        if total_edges > 0:
+            summary['plip_consistency_precision'] = (meter.acc['plip_consistency_precision'] / len(loader)).item()
+            summary['plip_consistency_recall'] = (meter.acc['plip_consistency_recall'] / len(loader)).item()
+            summary['plip_consistency_adjusted'] = meter.acc.get('plip_consistency_adjusted', torch.tensor(0.0)).item()
+    if grad_norm is not None:
+        summary['grad_norm_last'] = grad_norm
     if log_perf and perf_samples:
         mean_time = np.mean([p['time_s'] for p in perf_samples])
         summary['perf_time_s'] = float(mean_time)
@@ -572,6 +643,8 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
 
     perf_samples = []
     reports = []
+    plip_stats_accum: Dict[str, float] = defaultdict(float)
+    grad_norm = None
     for data in tqdm(loader, total=len(loader)):
         try:
             start_time = time.time()
@@ -595,6 +668,11 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                        plip_cls_loss if torch.is_tensor(plip_cls_loss) else torch.tensor(plip_cls_loss),
                        plip_geom_loss if torch.is_tensor(plip_geom_loss) else torch.tensor(plip_geom_loss),
                        torch.tensor(float(plip_matched_edges))])
+            if plip_consistency_threshold is not None:
+                plip_stats = _compute_plip_consistency(data if isinstance(data, list) else [data], threshold=plip_consistency_threshold,
+                                                       dist_min=plip_postprocess_min, dist_max=plip_postprocess_max)
+                for k, v in plip_stats.items():
+                    plip_stats_accum[k] += v
             if report_dir is not None:
                 reports.append(_collect_eval_report(data, loss, lddt_loss, plip_matched_edges))
             if log_perf:
@@ -651,6 +729,13 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     if stage_scheduler is not None:
         out['stage'] = stage_scheduler.stage
         out['stage_scale'] = stage_scheduler.scale
+    if plip_stats_accum:
+        edges = plip_stats_accum.get('plip_consistency_edges', 0)
+        out['plip_consistency_edges'] = edges
+        if edges > 0:
+            out['plip_consistency_precision'] = plip_stats_accum.get('plip_consistency_precision', 0.0) / len(loader)
+            out['plip_consistency_recall'] = plip_stats_accum.get('plip_consistency_recall', 0.0) / len(loader)
+            out['plip_consistency_adjusted'] = plip_stats_accum.get('plip_consistency_adjusted', 0.0)
     if log_perf and perf_samples:
         out['perf_time_s'] = float(np.mean([p['time_s'] for p in perf_samples]))
         if perf_samples and 'gpu_mem_mb' in perf_samples[0]:

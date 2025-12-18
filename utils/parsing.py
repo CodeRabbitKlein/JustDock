@@ -87,6 +87,9 @@ def parse_train_args():
     # Evaluation/visualization
     parser.add_argument('--eval_report_dir', type=str, default=None, help='Directory to dump evaluation metrics/JSON snapshots')
     parser.add_argument('--eval_dump_metrics', action='store_true', default=False, help='Whether to dump per-epoch evaluation metrics to file')
+    parser.add_argument('--plip_consistency_threshold', type=float, default=0.5, help='Confidence threshold for PLIP consistency metrics and optional post-processing')
+    parser.add_argument('--plip_postprocess_distance_min', type=float, default=None, help='Optional min distance clamp for PLIP-driven post-processing')
+    parser.add_argument('--plip_postprocess_distance_max', type=float, default=None, help='Optional max distance clamp for PLIP-driven post-processing')
     # Performance/monitoring
     parser.add_argument('--log_perf_metrics', action='store_true', default=False, help='Log batch time and peak memory during train/val')
 
