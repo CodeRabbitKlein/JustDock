@@ -148,12 +148,15 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             else:
                 scheduler.step(val_losses['loss'])
 
-        torch.save({
+        checkpoint_payload = {
             'epoch': epoch,
             'model': state_dict,
             'optimizer': optimizer.state_dict(),
             'ema_weights': ema_weights.state_dict(),
-        }, os.path.join(run_dir, 'last_model.pt'))
+        }
+        if stage_scheduler is not None:
+            checkpoint_payload['stage_scheduler'] = stage_scheduler.state_dict()
+        torch.save(checkpoint_payload, os.path.join(run_dir, 'last_model.pt'))
 
     print("Best Validation Loss {} on Epoch {}".format(best_val_loss, best_epoch))
     print("Best inference metric {} on Epoch {}".format(best_val_inference_value, best_val_inference_epoch))
@@ -201,6 +204,9 @@ def main_function():
             load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict['model'], strict=False, log_path=load_log_path)
             if hasattr(args, 'ema_rate'):
                 ema_weights.load_state_dict(dict['ema_weights'], device=device)
+            if 'stage_scheduler' in dict and 'stage_scheduler' in locals():
+                stage_scheduler.load_state_dict(dict['stage_scheduler'])
+                print("Loaded stage scheduler state.")
             print("Restarting from epoch", dict['epoch'])
             start_epoch = dict['epoch'] + 1
         except Exception as e:

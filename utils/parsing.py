@@ -91,6 +91,11 @@ def parse_train_args():
     parser.add_argument('--plip_postprocess_distance_min', type=float, default=None, help='Optional min distance clamp for PLIP-driven post-processing')
     parser.add_argument('--plip_postprocess_distance_max', type=float, default=None, help='Optional max distance clamp for PLIP-driven post-processing')
     parser.add_argument('--plip_postprocess_eval', action='store_true', default=False, help='Enable PLIP-guided post-processing during evaluation (adjust geometry for high-confidence edges)')
+    # Cross-edge chunking for large graphs
+    parser.add_argument('--cross_chunk_size', type=int, default=None, help='Max cross edges per chunk after graph construction (None disables chunking)')
+    parser.add_argument('--cross_chunk_autotune', action='store_true', default=False, help='Enable autotune of cross-edge chunk size based on perf metrics')
+    parser.add_argument('--cross_chunk_time_thresh', type=float, default=None, help='Per-batch time threshold (s) to trigger chunk size reduction')
+    parser.add_argument('--cross_chunk_mem_thresh', type=float, default=None, help='Per-batch peak GPU memory threshold (MB) to trigger chunk size reduction')
     # Performance/monitoring
     parser.add_argument('--log_perf_metrics', action='store_true', default=False, help='Log batch time and peak memory during train/val')
 

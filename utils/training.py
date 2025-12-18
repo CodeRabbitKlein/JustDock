@@ -410,6 +410,7 @@ class AdaptiveStageScheduler:
         self.cooldown = 0
         self.warmup_remaining = 0
         self.stage_history = [{'ema': None, 'best_ema': None, 'best_val': None} for _ in stage_scales]
+        self.last_switch_reason = None
 
     def state_dict(self):
         return {
@@ -419,6 +420,7 @@ class AdaptiveStageScheduler:
             'cooldown': self.cooldown,
             'warmup_remaining': self.warmup_remaining,
             'stage_history': self.stage_history,
+            'last_switch_reason': self.last_switch_reason,
         }
 
     def load_state_dict(self, state):
@@ -458,6 +460,7 @@ class AdaptiveStageScheduler:
         self.batch_in_stage = 0
         self.cooldown = self.cooldown_batches
         self.warmup_remaining = self.warmup_batches
+        self.last_switch_reason = 'plateau_or_explore'
         return True
 
     def _pick_target_stage(self):
@@ -480,7 +483,7 @@ class AdaptiveStageScheduler:
         if self.cooldown > 0:
             self.cooldown -= 1
         switched = self._maybe_switch()
-        return switched
+        return switched, self.last_switch_reason
 
     def on_validation_end(self, val_loss):
         val_val = val_loss if not torch.is_tensor(val_loss) else val_loss.item()
@@ -493,6 +496,7 @@ class AdaptiveStageScheduler:
             self.batch_in_stage = 0
             self.cooldown = self.cooldown_batches
             self.warmup_remaining = self.warmup_batches
+            self.last_switch_reason = 'backoff_val'
 
     def lr_scale(self):
         if self.warmup_remaining <= 0:
@@ -515,6 +519,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     train_loss = 0.0
     train_num = 0.0
     perf_samples = []
+    stage_switch_log: List[str] = []
     for data in bar:
         if device.type == 'cuda' and len(data) == 1 or device.type == 'cpu' and data.num_graphs == 1:
             print("Skipping batch of size 1 since otherwise batchnorm would not work.")
@@ -553,7 +558,9 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                        plip_geom_loss if torch.is_tensor(plip_geom_loss) else torch.tensor(plip_geom_loss),
                        torch.tensor(float(plip_matched_edges))])
             if stage_scheduler is not None:
-                stage_scheduler.on_batch_end(loss.detach())
+                switched, reason = stage_scheduler.on_batch_end(loss.detach())
+                if switched and reason:
+                    stage_switch_log.append(f"stage->{stage_scheduler.stage} reason={reason} batch_in_stage={stage_scheduler.batch_in_stage}")
             if plip_consistency_threshold is not None:
                 plip_stats = _compute_plip_consistency(data, threshold=plip_consistency_threshold, dist_min=plip_postprocess_min, dist_max=plip_postprocess_max)
                 for k, v in plip_stats.items():
@@ -569,6 +576,9 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                     perf_entry['gpu_mem_mb'] = torch.cuda.max_memory_allocated() / (1024 * 1024)
                     torch.cuda.reset_peak_memory_stats()
                 perf_samples.append(perf_entry)
+                target_model = model.module if hasattr(model, 'module') else model
+                if hasattr(target_model, 'maybe_autotune_chunk'):
+                    target_model.maybe_autotune_chunk(elapsed, perf_entry.get('gpu_mem_mb'))
         except RuntimeError as e:
             if 'out of memory' in str(e):
                 skip_counts['oom'] += 1
@@ -624,6 +634,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     if stage_scheduler is not None:
         summary['stage'] = stage_scheduler.stage
         summary['stage_scale'] = stage_scheduler.scale
+        if stage_switch_log:
+            summary['stage_switches'] = stage_switch_log
     if 'plip_consistency_precision' in meter.acc:
         total_edges = meter.acc.get('plip_consistency_edges', torch.tensor(0.0)).item()
         summary['plip_consistency_edges'] = total_edges
@@ -669,15 +681,25 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     perf_samples = []
     reports = []
     plip_stats_accum: Dict[str, float] = defaultdict(float)
+    plip_stats_post: Dict[str, float] = defaultdict(float)
     grad_norm = None
     for data in tqdm(loader, total=len(loader)):
         try:
             start_time = time.time()
             with torch.no_grad():
                 lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
+                if plip_consistency_threshold is not None:
+                    pre_stats = _compute_plip_consistency(data if isinstance(data, list) else [data], threshold=plip_consistency_threshold,
+                                                          dist_min=None, dist_max=None)
+                    for k, v in pre_stats.items():
+                        plip_stats_accum[f'pre_{k}'] += v
                 if plip_postprocess_eval and plip_consistency_threshold is not None:
                     _plip_postprocess_predictions(data if isinstance(data, list) else [data], threshold=plip_consistency_threshold,
                                                   dist_min=plip_postprocess_min, dist_max=plip_postprocess_max)
+                    post_stats = _compute_plip_consistency(data if isinstance(data, list) else [data], threshold=plip_consistency_threshold,
+                                                           dist_min=plip_postprocess_min, dist_max=plip_postprocess_max)
+                    for k, v in post_stats.items():
+                        plip_stats_post[f'post_{k}'] += v
 
             stage_scale = stage_scheduler.scale if stage_scheduler is not None else 1.0
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
@@ -757,13 +779,16 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     if stage_scheduler is not None:
         out['stage'] = stage_scheduler.stage
         out['stage_scale'] = stage_scheduler.scale
-    if plip_stats_accum:
-        edges = plip_stats_accum.get('plip_consistency_edges', 0)
-        out['plip_consistency_edges'] = edges
-        if edges > 0:
-            out['plip_consistency_precision'] = plip_stats_accum.get('plip_consistency_precision', 0.0) / len(loader)
-            out['plip_consistency_recall'] = plip_stats_accum.get('plip_consistency_recall', 0.0) / len(loader)
-            out['plip_consistency_adjusted'] = plip_stats_accum.get('plip_consistency_adjusted', 0.0)
+    def _aggregate_plip(prefix_dict, key_prefix):
+        if prefix_dict:
+            edges = prefix_dict.get(f'{key_prefix}plip_consistency_edges', 0)
+            out[f'{key_prefix}plip_consistency_edges'] = edges
+            if edges > 0:
+                out[f'{key_prefix}plip_consistency_precision'] = prefix_dict.get(f'{key_prefix}plip_consistency_precision', 0.0) / len(loader)
+                out[f'{key_prefix}plip_consistency_recall'] = prefix_dict.get(f'{key_prefix}plip_consistency_recall', 0.0) / len(loader)
+                out[f'{key_prefix}plip_consistency_adjusted'] = prefix_dict.get(f'{key_prefix}plip_consistency_adjusted', 0.0)
+    _aggregate_plip(plip_stats_accum, 'pre_')
+    _aggregate_plip(plip_stats_post, 'post_')
     if log_perf and perf_samples:
         out['perf_time_s'] = float(np.mean([p['time_s'] for p in perf_samples]))
         if perf_samples and 'gpu_mem_mb' in perf_samples[0]:
