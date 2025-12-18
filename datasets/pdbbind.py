@@ -129,6 +129,7 @@ class PDBBind(Dataset):
         self.plip_confidence_threshold = plip_confidence_threshold
         self.plip_interaction_types = plip_interaction_types if plip_interaction_types is not None else list(DEFAULT_INTERACTION_TYPES)
         self.cache_failures = defaultdict(list)
+        self._cache_summary_logged = False
         self.plip_index_anomalies = []
         self._rebuilt_cache = False
         if matching or protein_path_list is not None and ligand_descriptions is not None:
@@ -205,8 +206,11 @@ class PDBBind(Dataset):
         try:
             with open(path, 'rb') as f:
                 obj = pickle.load(f)
+        except FileNotFoundError as e:
+            self.cache_failures['missing'].append({'description': description, 'path': path})
+            raise
         except Exception as e:
-            self.cache_failures['io'].append((description, str(e)))
+            self.cache_failures['io'].append({'description': description, 'path': path, 'error': str(e)})
             raise
         metadata = {}
         data = obj
@@ -221,11 +225,14 @@ class PDBBind(Dataset):
             # legacy cache
             self.cache_failures['legacy'].append(description)
             return
-        if metadata.get('schema_version') != CACHE_SCHEMA_VERSION:
-            raise ValueError(f'{description} cache schema mismatch: expected {CACHE_SCHEMA_VERSION}, got {metadata.get("schema_version")}')
+        schema_version = metadata.get('schema_version')
+        if schema_version != CACHE_SCHEMA_VERSION:
+            self.cache_failures['schema_mismatch'].append({'description': description, 'found': schema_version})
+            raise ValueError(f'{description} cache schema mismatch: expected {CACHE_SCHEMA_VERSION}, got {schema_version}')
         if self.use_plip:
             cached_types = metadata.get('plip_interaction_types')
-            if cached_types is not None and set(cached_types) != set(self.plip_interaction_types):
+            if cached_types is None or set(cached_types) != set(self.plip_interaction_types):
+                self.cache_failures['plip_type_mismatch'].append({'description': description, 'cached': cached_types})
                 raise ValueError(f'{description} cache PLIP types mismatch: expected {self.plip_interaction_types}, got {cached_types}')
 
     def _maybe_rebuild_cache(self, reason):
@@ -238,6 +245,39 @@ class PDBBind(Dataset):
         else:
             self.inference_preprocessing()
         self._rebuilt_cache = True
+        self._log_cache_anomalies()
+
+    def _log_cache_anomalies(self):
+        if self._cache_summary_logged:
+            return
+        missing_entries = self.cache_failures.get('missing', []) + self.cache_failures.get('legacy', [])
+        damaged_entries = self.cache_failures.get('io', []) + self.cache_failures.get('schema_mismatch', [])
+        plip_mismatch_entries = self.cache_failures.get('plip_type_mismatch', [])
+
+        def _format(entries):
+            formatted = []
+            for entry in entries:
+                if isinstance(entry, dict):
+                    label = entry.get('description') or entry.get('name') or 'unknown'
+                    details = []
+                    for key in ('path', 'error', 'found', 'cached'):
+                        if key in entry and entry[key] is not None:
+                            details.append(f'{key}={entry[key]}')
+                    formatted.append(f'{label} ({", ".join(details)})' if details else label)
+                else:
+                    formatted.append(str(entry))
+            return ', '.join(formatted)
+
+        if not (missing_entries or damaged_entries or plip_mismatch_entries):
+            return
+        print('Cache anomaly summary (triggered rebuild):')
+        if missing_entries:
+            print(f'  Missing caches: {_format(missing_entries)}')
+        if damaged_entries:
+            print(f'  Damaged caches: {_format(damaged_entries)}')
+        if plip_mismatch_entries:
+            print(f'  PLIP type mismatches: {_format(plip_mismatch_entries)}')
+        self._cache_summary_logged = True
 
     def get(self, idx):
         complex_graph = copy.deepcopy(self.complex_graphs[idx])
@@ -264,6 +304,7 @@ class PDBBind(Dataset):
             return
         cached_types = cache.get('interaction_types')
         if cached_types is not None and set(cached_types) != set(self.plip_interaction_types):
+            self.cache_failures['plip_type_mismatch'].append({'name': name, 'cached': cached_types})
             print(f'PLIP cache interaction types mismatch for {name}: cache has {cached_types}, expected {self.plip_interaction_types}.')
         lig_count = complex_graph['ligand'].num_nodes
         rec_count = complex_graph['receptor'].num_nodes
