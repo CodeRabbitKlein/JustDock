@@ -43,7 +43,9 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
         if not args.only_test:
 
-            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm, loss_clamp_value=args.loss_clamp)
+            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm, loss_clamp_value=args.loss_clamp,
+                                       plip_teacher_weight=args.plip_teacher_weight, plip_teacher_geom_weight=args.plip_teacher_geom_weight,
+                                       plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing)
             print("Epoch {}: Training loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, train_losses['loss'], train_losses['lddt_loss'], train_losses['affinity_loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                           train_losses['tor_loss'], train_losses['res_tr_loss'], train_losses['res_rot_loss'], train_losses['res_chi_loss']))
@@ -74,7 +76,9 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
             ema_weights.store(model.parameters())
             if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
-            val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
+            val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals,
+                                   plip_teacher_weight=args.plip_teacher_weight, plip_teacher_geom_weight=args.plip_teacher_geom_weight,
+                                   plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing)
             print("Epoch {}: Validation loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, val_losses['loss'], val_losses['lddt_loss'], val_losses['affinity_loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'],
                             val_losses['res_tr_loss'], val_losses['res_rot_loss'], val_losses['res_chi_loss']))

@@ -64,3 +64,4 @@ def test_load_plip_cache_legacy_pickle(tmp_path):
     assert result["schema_version"] == 0
     assert result["interaction_types"] == list(DEFAULT_INTERACTION_TYPES)
     assert result["interactions"] == payload["interactions"]
+    assert result["_schema_mismatch"] is True
