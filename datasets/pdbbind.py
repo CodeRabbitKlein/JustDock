@@ -7,6 +7,7 @@ from collections import defaultdict
 from multiprocessing import Pool
 import random
 import copy
+import math
 import pandas as pd
 import numpy as np
 # from biopandas.pdb import PandasPdb
@@ -23,7 +24,12 @@ from tqdm import tqdm
 from datasets.process_mols import read_molecule, get_rec_graph, generate_conformer, \
     get_lig_graph_with_matching, extract_receptor_structure, parse_receptor, parse_pdb_from_path, \
     lig_feature_dims, rec_residue_feature_dims
-from datasets.plip_extract import DEFAULT_INTERACTION_TYPES, load_plip_cache
+from datasets.plip_extract import (
+    DEFAULT_INTERACTION_TYPES,
+    PLIP_CACHE_SCHEMA_VERSION,
+    extract_plip_interactions,
+    load_plip_cache,
+)
 from utils.diffusion_utils import modify_conformer, set_time
 from utils.utils import read_strings_from_txt
 from utils import so3, torus
@@ -104,7 +110,9 @@ class PDBBind(Dataset):
                  matching=True, keep_original=False, max_lig_size=None, remove_hs=False, num_conformers=1, center_ligand=False, all_atoms=False,
                  atom_radius=5, atom_max_neighbors=None, esm_embeddings_path=None, require_ligand=False, require_receptor=False,
                  ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=False, use_existing_cache=True,
-                 use_plip=False, plip_cache_dir='data/cache_plip', plip_confidence_threshold=0.5, plip_interaction_types=None):
+                 use_plip=False, plip_cache_dir='data/cache_plip', plip_confidence_threshold=0.5, plip_interaction_types=None,
+                 plip_auto_rebuild=False, plip_skip_invalid=True, plip_max_interactions_per_residue=None,
+                 plip_max_interactions_per_ligand_atom=None, plip_distance_max=None, plip_min_confidence=None):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
@@ -132,6 +140,16 @@ class PDBBind(Dataset):
         self._cache_summary_logged = False
         self.plip_index_anomalies = []
         self._rebuilt_cache = False
+        self.plip_auto_rebuild = plip_auto_rebuild
+        self.plip_skip_invalid = plip_skip_invalid
+        self.plip_max_interactions_per_residue = plip_max_interactions_per_residue
+        self.plip_max_interactions_per_ligand_atom = plip_max_interactions_per_ligand_atom
+        self.plip_distance_max = plip_distance_max
+        self.plip_min_confidence = plip_min_confidence
+        self._plip_disabled = False
+        self._plip_disable_reason = None
+        self._plip_rebuild_attempted = set()
+        self.plip_bad_samples = []
         if matching or protein_path_list is not None and ligand_descriptions is not None:
             cache_path += '_torsion'
         if all_atoms:
@@ -277,7 +295,145 @@ class PDBBind(Dataset):
             print(f'  Damaged caches: {_format(damaged_entries)}')
         if plip_mismatch_entries:
             print(f'  PLIP type mismatches: {_format(plip_mismatch_entries)}')
+        if self.plip_bad_samples:
+            bad_summary = ', '.join([f"{e['name']} ({e['reason']})" for e in self.plip_bad_samples])
+            print(f'  PLIP validation failures: {bad_summary}')
         self._cache_summary_logged = True
+
+    def _disable_plip(self, reason):
+        if self._plip_disabled:
+            return
+        self._plip_disabled = True
+        self._plip_disable_reason = reason
+        self.use_plip = False
+        print(f'Disabling PLIP features: {reason}. Falling back to non-PLIP mode.')
+
+    def _maybe_rebuild_plip_cache(self, name, reason):
+        if not self.plip_auto_rebuild or name in self._plip_rebuild_attempted:
+            return False
+        self._plip_rebuild_attempted.add(name)
+        pdb_path = os.path.join(self.pdbbind_dir, name, f"{name}.pdb")
+        if not os.path.exists(pdb_path):
+            self.plip_bad_samples.append({'name': name, 'reason': f'{reason}; missing pdb at {pdb_path}'})
+            return False
+        try:
+            print(f'Rebuilding PLIP cache for {name} due to {reason}...')
+            extract_plip_interactions(pdb_path, name, self.plip_cache_dir, overwrite=True)
+            return True
+        except Exception as exc:
+            self.plip_bad_samples.append({'name': name, 'reason': f'{reason}; rebuild failed: {exc}'})
+            return False
+
+    def _validate_plip_entries(self, cache, name, lig_count, rec_count):
+        normalized = []
+        invalid_entries = []
+        for entry in cache.get('interactions', []):
+            try:
+                lig_idx = int(entry.get('lig_atom_idx'))
+                rec_idx = int(entry.get('rec_residue_idx'))
+            except Exception:
+                invalid_entries.append(entry)
+                continue
+            if lig_idx >= lig_count or rec_idx >= rec_count or lig_idx < 0 or rec_idx < 0:
+                invalid_entries.append({'lig': lig_idx, 'rec': rec_idx})
+                continue
+            normalized.append({
+                'lig_atom_idx': lig_idx,
+                'rec_residue_idx': rec_idx,
+                'interaction_type': entry.get('interaction_type', 'misc'),
+                'distance': float(entry.get('distance', 0.0)),
+                'angle': float(entry.get('angle', 0.0)) if entry.get('angle') is not None else 0.0,
+                'direction': entry.get('direction', [0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0],
+                'confidence': float(entry.get('confidence', 1.0)),
+            })
+        if invalid_entries:
+            self.plip_index_anomalies.append({'name': name, 'invalid': len(invalid_entries), 'total': len(cache.get('interactions', [])), 'lig_nodes': lig_count, 'rec_nodes': rec_count})
+        return normalized, invalid_entries
+
+    def _filter_plip_interactions(self, interactions):
+        stats = defaultdict(int)
+        filtered = []
+        clipped_flags = []
+        res_counts = defaultdict(int)
+        lig_counts = defaultdict(int)
+        max_per_res = self.plip_max_interactions_per_residue
+        max_per_lig = self.plip_max_interactions_per_ligand_atom
+        distance_cap = self.plip_distance_max
+        min_conf = self.plip_min_confidence
+
+        for entry in interactions:
+            stats['total_before'] += 1
+            if min_conf is not None and entry['confidence'] < min_conf:
+                stats['dropped_low_conf'] += 1
+                continue
+            if distance_cap is not None and entry['distance'] > distance_cap:
+                stats['dropped_distance'] += 1
+                continue
+            if max_per_res is not None and res_counts[entry['rec_residue_idx']] >= max_per_res:
+                stats['dropped_max_residue'] += 1
+                continue
+            if max_per_lig is not None and lig_counts[entry['lig_atom_idx']] >= max_per_lig:
+                stats['dropped_max_ligand'] += 1
+                continue
+
+            clipped = False
+            if distance_cap is not None:
+                if entry['distance'] > distance_cap:
+                    clipped = True
+                entry['distance'] = min(entry['distance'], distance_cap)
+            entry['angle'] = max(0.0, min(float(entry['angle']), math.pi))
+            direction = np.asarray(entry.get('direction', [0.0, 0.0, 0.0]), dtype=float)
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / max(norm, 1.0)
+            direction = np.clip(direction, -1.0, 1.0)
+            if norm > 1.0 or np.any((direction < -1.0) | (direction > 1.0)):
+                clipped = True
+            entry['direction'] = direction.tolist()
+
+            filtered.append(entry)
+            clipped_flags.append(clipped)
+            res_counts[entry['rec_residue_idx']] += 1
+            lig_counts[entry['lig_atom_idx']] += 1
+
+        stats['kept'] = len(filtered)
+        stats['clipped'] = int(sum(clipped_flags))
+        return filtered, stats, clipped_flags
+
+    def _load_validated_plip_cache(self, name, lig_count, rec_count):
+        if self._plip_disabled:
+            return None
+        cache = load_plip_cache(name, self.plip_cache_dir)
+        if cache is None:
+            if self._maybe_rebuild_plip_cache(name, 'missing cache'):
+                cache = load_plip_cache(name, self.plip_cache_dir)
+        if cache is None:
+            print(f'PLIP cache missing for {name}, skipping PLIP features.')
+            return None
+        if cache.get('_schema_mismatch'):
+            self._disable_plip(f'cache schema version {cache.get("schema_version")} != {PLIP_CACHE_SCHEMA_VERSION}')
+            return None
+        cached_types = cache.get('interaction_types')
+        if cached_types is None or set(cached_types) != set(self.plip_interaction_types):
+            self.cache_failures['plip_type_mismatch'].append({'name': name, 'cached': cached_types})
+            if self._maybe_rebuild_plip_cache(name, f'type mismatch: {cached_types} vs {self.plip_interaction_types}'):
+                cache = load_plip_cache(name, self.plip_cache_dir)
+                cached_types = cache.get('interaction_types') if cache else None
+            if cached_types is None or set(cached_types) != set(self.plip_interaction_types):
+                self.plip_bad_samples.append({'name': name, 'reason': 'interaction_types mismatch'})
+                return None
+
+        normalized, invalid_entries = self._validate_plip_entries(cache, name, lig_count, rec_count)
+        if invalid_entries:
+            print(f'PLIP cache index mismatch for {name}: {len(invalid_entries)} invalid interactions skipped (lig_nodes={lig_count}, rec_nodes={rec_count}).')
+            if self._maybe_rebuild_plip_cache(name, 'index mismatch'):
+                return self._load_validated_plip_cache(name, lig_count, rec_count)
+            if self.plip_skip_invalid:
+                self.plip_bad_samples.append({'name': name, 'reason': 'index mismatch'})
+                return None
+        cache = dict(cache)
+        cache['interactions'] = normalized
+        return cache
 
     def get(self, idx):
         complex_graph = copy.deepcopy(self.complex_graphs[idx])
@@ -296,47 +452,31 @@ class PDBBind(Dataset):
         return complex_graph
 
     def _apply_plip_interactions(self, complex_graph, name):
-        if not self.use_plip:
+        if not self.use_plip or self._plip_disabled:
             return
-        cache = load_plip_cache(name, self.plip_cache_dir)
-        if cache is None or cache.get('interactions') is None:
-            print(f'PLIP cache missing for {name}, skipping PLIP features.')
-            return
-        cached_types = cache.get('interaction_types')
-        if cached_types is not None and set(cached_types) != set(self.plip_interaction_types):
-            self.cache_failures['plip_type_mismatch'].append({'name': name, 'cached': cached_types})
-            print(f'PLIP cache interaction types mismatch for {name}: cache has {cached_types}, expected {self.plip_interaction_types}.')
         lig_count = complex_graph['ligand'].num_nodes
         rec_count = complex_graph['receptor'].num_nodes
+        cache = self._load_validated_plip_cache(name, lig_count, rec_count)
+        if cache is None or cache.get('interactions') is None:
+            return
+        filtered, clip_stats, clipped_flags = self._filter_plip_interactions(cache.get('interactions', []))
+        if len(filtered) == 0:
+            self.plip_bad_samples.append({'name': name, 'reason': 'no valid interactions after filtering'})
+            return
         lig_idxs, rec_idxs, types, distances, angles, directions, confidences = [], [], [], [], [], [], []
-        invalid_entries = []
-        for entry in cache.get('interactions', []):
-            try:
-                lig_idx = int(entry.get('lig_atom_idx'))
-                rec_idx = int(entry.get('rec_residue_idx'))
-            except Exception:
-                invalid_entries.append(entry)
-                continue
-            if lig_idx >= lig_count or rec_idx >= rec_count or lig_idx < 0 or rec_idx < 0:
-                invalid_entries.append({'lig': lig_idx, 'rec': rec_idx})
-                continue
+        for entry in filtered:
             interaction_type = entry.get('interaction_type', 'misc')
             if interaction_type not in self.plip_interaction_types:
                 continue
-            lig_idxs.append(lig_idx)
-            rec_idxs.append(rec_idx)
+            lig_idxs.append(entry['lig_atom_idx'])
+            rec_idxs.append(entry['rec_residue_idx'])
             types.append(self.plip_interaction_types.index(interaction_type))
             distances.append(float(entry.get('distance', 0.0)))
-            angles.append(float(entry.get('angle', 0.0)) if entry.get('angle') is not None else 0.0)
-            direction = entry.get('direction', [0.0, 0.0, 0.0])
-            if direction is None:
-                direction = [0.0, 0.0, 0.0]
-            directions.append(direction)
+            angles.append(float(entry.get('angle', 0.0)))
+            directions.append(entry.get('direction', [0.0, 0.0, 0.0]) or [0.0, 0.0, 0.0])
             confidences.append(float(entry.get('confidence', 1.0)))
-        if invalid_entries:
-            self.plip_index_anomalies.append({'name': name, 'invalid': len(invalid_entries), 'total': len(cache.get('interactions', [])), 'lig_nodes': lig_count, 'rec_nodes': rec_count})
-            print(f'PLIP cache index mismatch for {name}: {len(invalid_entries)} invalid interactions skipped (lig_nodes={lig_count}, rec_nodes={rec_count}).')
         if len(lig_idxs) == 0:
+            self.plip_bad_samples.append({'name': name, 'reason': 'no valid interactions'})
             return
         edge_index = torch.tensor([lig_idxs, rec_idxs], dtype=torch.long)
         complex_graph.plip_edge_index = edge_index
@@ -345,6 +485,7 @@ class PDBBind(Dataset):
         complex_graph.plip_angle = torch.tensor(angles, dtype=torch.float32)
         complex_graph.plip_direction = torch.tensor(directions, dtype=torch.float32)
         complex_graph.plip_confidence = torch.tensor(confidences, dtype=torch.float32)
+        complex_graph.plip_clipped_mask = torch.tensor(clipped_flags, dtype=torch.bool)
         complex_graph.plip_interactions = {
             'edge_index': edge_index,
             'type': complex_graph.plip_type,
@@ -352,7 +493,9 @@ class PDBBind(Dataset):
             'angle': complex_graph.plip_angle,
             'direction': complex_graph.plip_direction,
             'confidence': complex_graph.plip_confidence,
+            'clipped_mask': complex_graph.plip_clipped_mask,
         }
+        complex_graph.plip_clip_info = dict(clip_stats)
         # anchor masks
         lig_anchor = complex_graph['ligand'].anchor_mask.clone()
         rec_anchor = complex_graph['receptor'].anchor_mask.clone()
@@ -650,7 +793,8 @@ class PDBBindScoring(Dataset):
                  matching=True, keep_original=False, max_lig_size=None, remove_hs=False, num_conformers=1, center_ligand=False, all_atoms=False,
                  atom_radius=5, atom_max_neighbors=None, esm_embeddings_path=None, require_ligand=False, require_receptor=False,
                  ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=False, use_existing_cache=True,
-                 use_plip=False, plip_cache_dir='data/cache_plip', plip_confidence_threshold=0.5, plip_interaction_types=None):
+                 use_plip=False, plip_cache_dir='data/cache_plip', plip_confidence_threshold=0.5, plip_interaction_types=None,
+                 plip_auto_rebuild=False, plip_skip_invalid=True):
 
         super().__init__(root, transform)
         self.pdbbind_dir = root
@@ -674,6 +818,8 @@ class PDBBindScoring(Dataset):
         self.plip_confidence_threshold = plip_confidence_threshold
         self.plip_interaction_types = plip_interaction_types if plip_interaction_types is not None else list(DEFAULT_INTERACTION_TYPES)
         self.cache_failures = defaultdict(list)
+        self.plip_auto_rebuild = plip_auto_rebuild
+        self.plip_skip_invalid = plip_skip_invalid
         if matching or protein_path_list is not None and ligand_descriptions is not None:
             cache_path += '_torsion'
         if all_atoms:
@@ -1008,7 +1154,13 @@ def construct_loader(args, t_to_sigma):
                    'use_plip': args.use_plip,
                    'plip_cache_dir': args.plip_cache_dir,
                    'plip_confidence_threshold': args.plip_confidence_threshold,
-                   'plip_interaction_types': args.plip_interaction_types.split(',') if args.plip_interaction_types else None}
+                   'plip_interaction_types': args.plip_interaction_types.split(',') if args.plip_interaction_types else None,
+                   'plip_auto_rebuild': getattr(args, 'plip_auto_rebuild', False),
+                   'plip_skip_invalid': getattr(args, 'plip_skip_invalid', True),
+                   'plip_max_interactions_per_residue': getattr(args, 'plip_max_interactions_per_residue', None),
+                   'plip_max_interactions_per_ligand_atom': getattr(args, 'plip_max_interactions_per_ligand_atom', None),
+                   'plip_distance_max': getattr(args, 'plip_distance_max', None),
+                   'plip_min_confidence': getattr(args, 'plip_min_confidence', None)}
     info=pd.read_csv(args.info_path,dtype={'gap_mask':str})
     train_dataset = PDBBind(info=info,cache_path=args.cache_path, split_path=args.split_train, keep_original=True,
                             num_conformers=args.num_conformers, **common_args)
