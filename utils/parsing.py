@@ -63,6 +63,35 @@ def parse_train_args():
     parser.add_argument('--plip_cache_dir', type=str, default='data/cache_plip', help='Directory holding cached PLIP outputs')
     parser.add_argument('--plip_confidence_threshold', type=float, default=0.5, help='Confidence threshold for anchor assignment')
     parser.add_argument('--plip_interaction_types', type=str, default=None, help='Comma separated list of PLIP interaction types to keep')
+    parser.add_argument('--plip_auto_rebuild', action='store_true', default=False, help='Re-run PLIP extraction when caches are missing or invalid')
+    parser.add_argument('--plip_skip_invalid', action='store_true', default=True, help='Skip PLIP attachment when validation fails instead of keeping stale data')
+    parser.add_argument('--plip_max_interactions_per_residue', type=int, default=None, help='Maximum PLIP interactions to keep per receptor residue')
+    parser.add_argument('--plip_max_interactions_per_ligand_atom', type=int, default=None, help='Maximum PLIP interactions to keep per ligand atom')
+    parser.add_argument('--plip_distance_max', type=float, default=None, help='Distance upper bound for PLIP features (values are clamped)')
+    parser.add_argument('--plip_min_confidence', type=float, default=None, help='Minimum PLIP interaction confidence to keep')
+    parser.add_argument('--plip_teacher_weight', type=float, default=0.0, help='Weight for PLIP interaction classification supervision')
+    parser.add_argument('--plip_teacher_geom_weight', type=float, default=0.0, help='Weight for PLIP geometry supervision (distance/angle)')
+    parser.add_argument('--plip_teacher_temperature', type=float, default=1.0, help='Temperature for PLIP teacher logits')
+    parser.add_argument('--plip_teacher_label_smoothing', type=float, default=0.0, help='Label smoothing for PLIP interaction classification supervision')
+    # Adaptive stage/three-phase noise scheduling
+    parser.add_argument('--stage_scales', type=str, default='1.0,0.8,0.6', help='Comma-separated noise scaling factors per stage (three-phase scheduling)')
+    parser.add_argument('--stage_min_batches', type=int, default=200, help='Minimum batches to stay in a stage before considering a switch')
+    parser.add_argument('--stage_cooldown_batches', type=int, default=50, help='Cooldown batches after a switch before the next decision')
+    parser.add_argument('--stage_plateau_tol', type=float, default=0.002, help='Relative plateau tolerance for triggering stage switches')
+    parser.add_argument('--stage_exploration_prob', type=float, default=0.05, help='Probability of exploring a non-best stage to escape local optima')
+    parser.add_argument('--stage_warmup_batches', type=int, default=5, help='Batches to warm up LR after switching stages')
+    # Physically informed loss robustness
+    parser.add_argument('--phys_loss_huber_delta', type=float, default=None, help='Delta for Huber/soft-clamp on distance/angle losses (None disables)')
+    parser.add_argument('--phys_loss_label_smoothing', type=float, default=0.0, help='Label smoothing for interaction type loss (if used)')
+    parser.add_argument('--phys_loss_weight_grid', type=str, default=None, help='Comma-separated weight candidates for quick grid search, e.g. "tr=1,rot=1|tr=0.5,rot=1.5"')
+    # Evaluation/visualization
+    parser.add_argument('--eval_report_dir', type=str, default=None, help='Directory to dump evaluation metrics/JSON snapshots')
+    parser.add_argument('--eval_dump_metrics', action='store_true', default=False, help='Whether to dump per-epoch evaluation metrics to file')
+    parser.add_argument('--plip_consistency_threshold', type=float, default=0.5, help='Confidence threshold for PLIP consistency metrics and optional post-processing')
+    parser.add_argument('--plip_postprocess_distance_min', type=float, default=None, help='Optional min distance clamp for PLIP-driven post-processing')
+    parser.add_argument('--plip_postprocess_distance_max', type=float, default=None, help='Optional max distance clamp for PLIP-driven post-processing')
+    # Performance/monitoring
+    parser.add_argument('--log_perf_metrics', action='store_true', default=False, help='Log batch time and peak memory during train/val')
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')
