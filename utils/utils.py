@@ -98,11 +98,18 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
         embedding_scale=args.embedding_scale)
 
     lm_embedding_type = None
-    if args.esm_embeddings_path is not None: lm_embedding_type = 'esm'
-    plip_types = args.plip_interaction_types.split(',') if args.plip_interaction_types else list(DEFAULT_INTERACTION_TYPES)
+    if getattr(args, 'esm_embeddings_path', None) is not None: lm_embedding_type = 'esm'
+    plip_interaction_types = getattr(args, 'plip_interaction_types', None)
+    if isinstance(plip_interaction_types, str):
+        plip_types = plip_interaction_types.split(',') if plip_interaction_types else list(DEFAULT_INTERACTION_TYPES)
+    elif plip_interaction_types is None:
+        plip_types = list(DEFAULT_INTERACTION_TYPES)
+    else:
+        plip_types = list(plip_interaction_types)
     plip_feat_dims = {'distance': 16, 'angle': 8}
-    if getattr(args, 'plip_feat_dims', None):
-        for token in args.plip_feat_dims.split(','):
+    parsed_plip_feat_dims = getattr(args, 'plip_feat_dims', None)
+    if parsed_plip_feat_dims:
+        for token in parsed_plip_feat_dims.split(','):
             if '=' not in token:
                 continue
             k, v = token.split('=')
@@ -111,7 +118,11 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                     plip_feat_dims[k.strip()] = int(v)
                 except ValueError:
                     print(f'Could not parse plip_feat_dims token {token}, keeping default.')
-    use_plip_features = getattr(args, 'use_plip_features', False) and args.use_plip
+    use_plip = getattr(args, 'use_plip', False)
+    use_plip_features_requested = getattr(args, 'use_plip_features', False)
+    if use_plip_features_requested and not use_plip:
+        warnings.warn('use_plip_features requested but use_plip is False; disabling PLIP features for backward compatibility.', stacklevel=2)
+    use_plip_features = use_plip_features_requested and use_plip
     plip_num_types = len(plip_types) if use_plip_features else 0
 
     model = model_class(t_to_sigma=t_to_sigma,
@@ -135,7 +146,7 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                         num_confidence_outputs=len(
                             args.rmsd_classification_cutoff) + 1 if 'rmsd_classification_cutoff' in args and isinstance(
                             args.rmsd_classification_cutoff, list) else 1,
-                        use_plip=args.use_plip,
+                        use_plip=use_plip,
                         use_plip_features=use_plip_features,
                         plip_num_types=plip_num_types,
                         plip_distance_embed_dim=plip_feat_dims['distance'],
