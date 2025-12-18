@@ -84,6 +84,11 @@ def parse_train_args():
     parser.add_argument('--phys_loss_huber_delta', type=float, default=None, help='Delta for Huber/soft-clamp on distance/angle losses (None disables)')
     parser.add_argument('--phys_loss_label_smoothing', type=float, default=0.0, help='Label smoothing for interaction type loss (if used)')
     parser.add_argument('--phys_loss_weight_grid', type=str, default=None, help='Comma-separated weight candidates for quick grid search, e.g. "tr=1,rot=1|tr=0.5,rot=1.5"')
+    # Evaluation/visualization
+    parser.add_argument('--eval_report_dir', type=str, default=None, help='Directory to dump evaluation metrics/JSON snapshots')
+    parser.add_argument('--eval_dump_metrics', action='store_true', default=False, help='Whether to dump per-epoch evaluation metrics to file')
+    # Performance/monitoring
+    parser.add_argument('--log_perf_metrics', action='store_true', default=False, help='Log batch time and peak memory during train/val')
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')

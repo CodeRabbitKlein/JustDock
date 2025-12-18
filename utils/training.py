@@ -1,6 +1,9 @@
 import copy
 from functools import partial
 import random
+import json
+import os
+import time
 
 import numpy as np
 from  scipy.spatial.transform import Rotation
@@ -289,6 +292,29 @@ def _compute_plip_teacher_losses(data, cls_weight=0.0, geom_weight=0.0, temperat
     return total, cls_loss.detach(), geom_loss if isinstance(geom_loss, torch.Tensor) else torch.tensor(geom_loss), matched_edges
 
 
+def _collect_eval_report(batch_data, loss, lddt_loss, plip_matched_edges):
+    try:
+        graphs = batch_data if isinstance(batch_data, list) else [batch_data]
+        report = {
+            'loss': float(loss.item() if torch.is_tensor(loss) else loss),
+            'lddt_loss': float(lddt_loss if not torch.is_tensor(lddt_loss) else lddt_loss.item()),
+            'plip_matched_edges': float(plip_matched_edges),
+            'anchor_recovery': [],
+            'plip_coverage': [],
+        }
+        for g in graphs:
+            lig_anchor = getattr(g['ligand'], 'anchor_mask', None)
+            rec_anchor = getattr(g['receptor'], 'anchor_mask', None)
+            if lig_anchor is not None and rec_anchor is not None:
+                report['anchor_recovery'].append({'ligand': float(lig_anchor.mean().item()), 'receptor': float(rec_anchor.mean().item())})
+            coverage = getattr(g, 'plip_edge_coverage', None)
+            if coverage is not None:
+                report['plip_coverage'].append(float(coverage))
+        return report
+    except Exception:
+        return {}
+
+
 class AdaptiveStageScheduler:
     def __init__(self, stage_scales, min_batches=200, cooldown_batches=50, plateau_tol=0.002, exploration_prob=0.05, warmup_batches=5, ema_alpha=0.1):
         self.stage_scales = stage_scales
@@ -399,7 +425,7 @@ class AdaptiveStageScheduler:
 
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None, loss_clamp_value=None,
                 plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
-                stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None):
+                stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None, log_perf=False):
     model.train()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'])
     skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0, 'singleton_batch': 0}
@@ -408,12 +434,14 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     bar = tqdm(loader, total=len(loader))
     train_loss = 0.0
     train_num = 0.0
+    perf_samples = []
     for data in bar:
         if device.type == 'cuda' and len(data) == 1 or device.type == 'cpu' and data.num_graphs == 1:
             print("Skipping batch of size 1 since otherwise batchnorm would not work.")
             skip_counts['singleton_batch'] += 1
             continue
         optimizer.zero_grad()
+        start_time = time.time()
         stage_scale = stage_scheduler.scale if stage_scheduler is not None else 1.0
         lr_scale = stage_scheduler.lr_scale() if stage_scheduler is not None else 1.0
         for group in optimizer.param_groups:
@@ -448,6 +476,13 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             train_loss += loss.item()
             train_num += 1
             bar.set_description('loss: %.4f' % (train_loss/train_num))
+            if log_perf:
+                elapsed = time.time() - start_time
+                perf_entry = {'time_s': elapsed}
+                if torch.cuda.is_available():
+                    perf_entry['gpu_mem_mb'] = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                    torch.cuda.reset_peak_memory_stats()
+                perf_samples.append(perf_entry)
         except RuntimeError as e:
             if 'out of memory' in str(e):
                 skip_counts['oom'] += 1
@@ -503,6 +538,11 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     if stage_scheduler is not None:
         summary['stage'] = stage_scheduler.stage
         summary['stage_scale'] = stage_scheduler.scale
+    if log_perf and perf_samples:
+        mean_time = np.mean([p['time_s'] for p in perf_samples])
+        summary['perf_time_s'] = float(mean_time)
+        if 'gpu_mem_mb' in perf_samples[0]:
+            summary['perf_gpu_mem_mb'] = float(np.max([p['gpu_mem_mb'] for p in perf_samples]))
     skipped_total = sum(skip_counts.values())
     if skipped_total > 0:
         print(f"| WARNING: Skipped {skipped_total} batches this epoch "
@@ -517,7 +557,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False,
                plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
-               stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None):
+               stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None, log_perf=False, report_dir=None, dump_metrics=False):
     model.eval()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'],
                          unpooled_metrics=True)
@@ -530,8 +570,11 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0}
     clamp_tracker = {}
 
+    perf_samples = []
+    reports = []
     for data in tqdm(loader, total=len(loader)):
         try:
+            start_time = time.time()
             with torch.no_grad():
                 lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
 
@@ -552,6 +595,15 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                        plip_cls_loss if torch.is_tensor(plip_cls_loss) else torch.tensor(plip_cls_loss),
                        plip_geom_loss if torch.is_tensor(plip_geom_loss) else torch.tensor(plip_geom_loss),
                        torch.tensor(float(plip_matched_edges))])
+            if report_dir is not None:
+                reports.append(_collect_eval_report(data, loss, lddt_loss, plip_matched_edges))
+            if log_perf:
+                elapsed = time.time() - start_time
+                perf_entry = {'time_s': elapsed}
+                if torch.cuda.is_available():
+                    perf_entry['gpu_mem_mb'] = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                    torch.cuda.reset_peak_memory_stats()
+                perf_samples.append(perf_entry)
 
             if test_sigma_intervals > 0:
                 complex_t_tr, complex_t_rot, complex_t_tor, complex_t_res_tr, complex_t_res_rot, complex_t_res_chi = [torch.cat([d.complex_t[noise_type] for d in data]) for
@@ -599,6 +651,18 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     if stage_scheduler is not None:
         out['stage'] = stage_scheduler.stage
         out['stage_scale'] = stage_scheduler.scale
+    if log_perf and perf_samples:
+        out['perf_time_s'] = float(np.mean([p['time_s'] for p in perf_samples]))
+        if perf_samples and 'gpu_mem_mb' in perf_samples[0]:
+            out['perf_gpu_mem_mb'] = float(np.max([p['gpu_mem_mb'] for p in perf_samples]))
+    if report_dir is not None and dump_metrics:
+        os.makedirs(report_dir, exist_ok=True)
+        report_path = os.path.join(report_dir, 'eval_metrics.json')
+        with open(report_path, 'w') as f:
+            json.dump(out, f, indent=2)
+        if reports:
+            with open(os.path.join(report_dir, 'eval_samples.json'), 'w') as f:
+                json.dump(reports, f, indent=2)
     skipped_total = sum(skip_counts.values())
     if skipped_total > 0:
         print(f"| WARNING: Skipped {skipped_total} batches during evaluation "
