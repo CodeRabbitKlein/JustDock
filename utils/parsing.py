@@ -73,6 +73,13 @@ def parse_train_args():
     parser.add_argument('--plip_teacher_geom_weight', type=float, default=0.0, help='Weight for PLIP geometry supervision (distance/angle)')
     parser.add_argument('--plip_teacher_temperature', type=float, default=1.0, help='Temperature for PLIP teacher logits')
     parser.add_argument('--plip_teacher_label_smoothing', type=float, default=0.0, help='Label smoothing for PLIP interaction classification supervision')
+    # Adaptive stage/three-phase noise scheduling
+    parser.add_argument('--stage_scales', type=str, default='1.0,0.8,0.6', help='Comma-separated noise scaling factors per stage (three-phase scheduling)')
+    parser.add_argument('--stage_min_batches', type=int, default=200, help='Minimum batches to stay in a stage before considering a switch')
+    parser.add_argument('--stage_cooldown_batches', type=int, default=50, help='Cooldown batches after a switch before the next decision')
+    parser.add_argument('--stage_plateau_tol', type=float, default=0.002, help='Relative plateau tolerance for triggering stage switches')
+    parser.add_argument('--stage_exploration_prob', type=float, default=0.05, help='Probability of exploring a non-best stage to escape local optima')
+    parser.add_argument('--stage_warmup_batches', type=int, default=5, help='Batches to warm up LR after switching stages')
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')

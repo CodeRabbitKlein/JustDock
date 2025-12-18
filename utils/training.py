@@ -1,5 +1,6 @@
 import copy
 from functools import partial
+import random
 
 import numpy as np
 from  scipy.spatial.transform import Rotation
@@ -18,7 +19,8 @@ import torch.nn.functional as F
 from torch_scatter import scatter_mean
 
 def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data, t_to_sigma, device, lddt_weight=1, affinity_weight=1, tr_weight=1, rot_weight=1,
-                  tor_weight=1, res_tr_weight=1, res_rot_weight=1, res_chi_weight=1, apply_mean=True, no_torsion=False, train_score=False, finetune=False, clamp_value=None, clamp_tracker=None):
+                  tor_weight=1, res_tr_weight=1, res_rot_weight=1, res_chi_weight=1, apply_mean=True, no_torsion=False, train_score=False, finetune=False, clamp_value=None, clamp_tracker=None,
+                  stage_scale=1.0):
     mean_dims = (0, 1) if apply_mean else 1
 
     def track_and_clamp(value, name):
@@ -37,6 +39,12 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     data_t = [torch.cat([d.complex_t[noise_type] for d in data]) if device.type == 'cuda' else data.complex_t[noise_type]
       for noise_type in ['tr', 'rot', 'tor', 'res_tr', 'res_rot', 'res_chi']]
     tr_sigma, rot_sigma, tor_sigma, res_tr_sigma, res_rot_sigma, res_chi_sigma  = t_to_sigma(*data_t)
+    tr_sigma = tr_sigma * stage_scale
+    rot_sigma = rot_sigma * stage_scale
+    tor_sigma = tor_sigma * stage_scale
+    res_tr_sigma = res_tr_sigma * stage_scale
+    res_rot_sigma = res_rot_sigma * stage_scale
+    res_chi_sigma = res_chi_sigma * stage_scale
     # res_tr_sigma = res_tr_sigma * torch.cat([d['receptor'].af2_trans_sigma for d in data]) if device.type == 'cuda' else data['receptor'].af2_trans_sigma
     # res_rot_sigma = res_rot_sigma * torch.cat([d['receptor'].af2_rotvecs_sigma for d in data]) if device.type == 'cuda' else data['receptor'].af2_rotvecs_sigma
     if tr_pred.abs().max() > 100:
@@ -257,8 +265,117 @@ def _compute_plip_teacher_losses(data, cls_weight=0.0, geom_weight=0.0, temperat
     return total, cls_loss.detach(), geom_loss if isinstance(geom_loss, torch.Tensor) else torch.tensor(geom_loss), matched_edges
 
 
+class AdaptiveStageScheduler:
+    def __init__(self, stage_scales, min_batches=200, cooldown_batches=50, plateau_tol=0.002, exploration_prob=0.05, warmup_batches=5, ema_alpha=0.1):
+        self.stage_scales = stage_scales
+        self.min_batches = min_batches
+        self.cooldown_batches = cooldown_batches
+        self.plateau_tol = plateau_tol
+        self.exploration_prob = exploration_prob
+        self.warmup_batches = warmup_batches
+        self.ema_alpha = ema_alpha
+
+        self.stage = 0
+        self.prev_stage = None
+        self.batch_in_stage = 0
+        self.cooldown = 0
+        self.warmup_remaining = 0
+        self.stage_history = [{'ema': None, 'best_ema': None, 'best_val': None} for _ in stage_scales]
+
+    def state_dict(self):
+        return {
+            'stage': self.stage,
+            'prev_stage': self.prev_stage,
+            'batch_in_stage': self.batch_in_stage,
+            'cooldown': self.cooldown,
+            'warmup_remaining': self.warmup_remaining,
+            'stage_history': self.stage_history,
+        }
+
+    def load_state_dict(self, state):
+        for k, v in state.items():
+            setattr(self, k, v)
+
+    @property
+    def scale(self):
+        return self.stage_scales[self.stage]
+
+    def _update_ema(self, loss):
+        hist = self.stage_history[self.stage]
+        if hist['ema'] is None:
+            hist['ema'] = loss
+        else:
+            hist['ema'] = self.ema_alpha * loss + (1 - self.ema_alpha) * hist['ema']
+        if hist['best_ema'] is None or hist['ema'] < hist['best_ema']:
+            hist['best_ema'] = hist['ema']
+
+    def _maybe_switch(self):
+        if self.batch_in_stage < self.min_batches:
+            return False
+        if self.cooldown > 0:
+            return False
+        current_ema = self.stage_history[self.stage]['ema']
+        current_best = self.stage_history[self.stage]['best_ema'] or current_ema
+        if current_ema is None:
+            return False
+        plateau = current_ema > current_best * (1 - self.plateau_tol)
+        if not plateau and random.random() > self.exploration_prob:
+            return False
+        target_stage = self._pick_target_stage()
+        if target_stage == self.stage:
+            return False
+        self.prev_stage = self.stage
+        self.stage = target_stage
+        self.batch_in_stage = 0
+        self.cooldown = self.cooldown_batches
+        self.warmup_remaining = self.warmup_batches
+        return True
+
+    def _pick_target_stage(self):
+        if random.random() < self.exploration_prob:
+            return random.randrange(len(self.stage_scales))
+        best_val = None
+        best_idx = self.stage
+        for i, hist in enumerate(self.stage_history):
+            if hist['best_ema'] is None:
+                continue
+            if best_val is None or hist['best_ema'] < best_val:
+                best_val = hist['best_ema']
+                best_idx = i
+        return best_idx
+
+    def on_batch_end(self, loss):
+        loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
+        self._update_ema(loss_val)
+        self.batch_in_stage += 1
+        if self.cooldown > 0:
+            self.cooldown -= 1
+        switched = self._maybe_switch()
+        return switched
+
+    def on_validation_end(self, val_loss):
+        val_val = val_loss if not torch.is_tensor(val_loss) else val_loss.item()
+        hist = self.stage_history[self.stage]
+        if hist['best_val'] is None or val_val < hist['best_val']:
+            hist['best_val'] = val_val
+        # Backoff if validation degrades badly after a recent switch
+        if self.prev_stage is not None and val_val > (hist['best_val'] or val_val) * (1 + self.plateau_tol * 5):
+            self.stage, self.prev_stage = self.prev_stage, None
+            self.batch_in_stage = 0
+            self.cooldown = self.cooldown_batches
+            self.warmup_remaining = self.warmup_batches
+
+    def lr_scale(self):
+        if self.warmup_remaining <= 0:
+            return 1.0
+        progress = (self.warmup_batches - self.warmup_remaining + 1) / max(self.warmup_batches, 1)
+        self.warmup_remaining -= 1
+        return max(0.1, progress)
+
+
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None, loss_clamp_value=None,
-                plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0):
+                plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
+                stage_scheduler: AdaptiveStageScheduler = None):
     model.train()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'])
     skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0, 'singleton_batch': 0}
@@ -273,10 +390,15 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             skip_counts['singleton_batch'] += 1
             continue
         optimizer.zero_grad()
+        stage_scale = stage_scheduler.scale if stage_scheduler is not None else 1.0
+        lr_scale = stage_scheduler.lr_scale() if stage_scheduler is not None else 1.0
+        for group in optimizer.param_groups:
+            group.setdefault('base_lr', group.get('base_lr', group['lr']))
+            group['lr'] = group['base_lr'] * lr_scale
         try:
             lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
-                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune, clamp_tracker=clamp_tracker)
+                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune, clamp_tracker=clamp_tracker, stage_scale=stage_scale)
             plip_teacher_loss, plip_cls_loss, plip_geom_loss, plip_matched_edges = _compute_plip_teacher_losses(
                 data,
                 cls_weight=plip_teacher_weight,
@@ -297,6 +419,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                        plip_cls_loss if torch.is_tensor(plip_cls_loss) else torch.tensor(plip_cls_loss),
                        plip_geom_loss if torch.is_tensor(plip_geom_loss) else torch.tensor(plip_geom_loss),
                        torch.tensor(float(plip_matched_edges))])
+            if stage_scheduler is not None:
+                stage_scheduler.on_batch_end(loss.detach())
             train_loss += loss.item()
             train_num += 1
             bar.set_description('loss: %.4f' % (train_loss/train_num))
@@ -352,6 +476,9 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     summary.update({f'batches_skipped_{k}': v for k, v in skip_counts.items()})
     summary['loss_clamp_events'] = sum(clamp_tracker.values())
     summary.update({f'clamp_{k}': v for k, v in clamp_tracker.items()})
+    if stage_scheduler is not None:
+        summary['stage'] = stage_scheduler.stage
+        summary['stage_scale'] = stage_scheduler.scale
     skipped_total = sum(skip_counts.values())
     if skipped_total > 0:
         print(f"| WARNING: Skipped {skipped_total} batches this epoch "
@@ -365,7 +492,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False,
-               plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0):
+               plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
+               stage_scheduler: AdaptiveStageScheduler = None):
     model.eval()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'],
                          unpooled_metrics=True)
@@ -383,8 +511,9 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             with torch.no_grad():
                 lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
 
+            stage_scale = stage_scheduler.scale if stage_scheduler is not None else 1.0
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
-                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device, clamp_tracker=clamp_tracker)
+                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device, clamp_tracker=clamp_tracker, stage_scale=stage_scale)
             plip_teacher_loss, plip_cls_loss, plip_geom_loss, plip_matched_edges = _compute_plip_teacher_losses(
                 data if isinstance(data, list) else [data],
                 cls_weight=plip_teacher_weight,
@@ -443,6 +572,9 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
     out.update({f'batches_skipped_{k}': v for k, v in skip_counts.items()})
     out['loss_clamp_events'] = sum(clamp_tracker.values())
     out.update({f'clamp_{k}': v for k, v in clamp_tracker.items()})
+    if stage_scheduler is not None:
+        out['stage'] = stage_scheduler.stage
+        out['stage_scale'] = stage_scheduler.scale
     skipped_total = sum(skip_counts.values())
     if skipped_total > 0:
         print(f"| WARNING: Skipped {skipped_total} batches during evaluation "

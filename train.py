@@ -18,7 +18,7 @@ import yaml
 from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
 from datasets.pdbbind import construct_loader
 from utils.parsing import parse_train_args
-from utils.training import train_epoch, test_epoch, loss_function, finetune_epoch, inference_epoch
+from utils.training import train_epoch, test_epoch, loss_function, finetune_epoch, inference_epoch, AdaptiveStageScheduler
 from utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, ExponentialMovingAverage, load_state_dict_flexible
 
 gpus = list(range(torch.cuda.device_count()))
@@ -31,6 +31,14 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     loss_fn = partial(loss_function, lddt_weight=args.lddt_weight, affinity_weight=args.affinity_weight, tr_weight=args.tr_weight, rot_weight=args.rot_weight,
                       tor_weight=args.tor_weight, res_tr_weight=args.res_tr_weight, res_rot_weight=args.res_rot_weight, res_chi_weight=args.res_chi_weight,
                       no_torsion=args.no_torsion, clamp_value=args.loss_clamp)
+
+    stage_scales = [float(x) for x in args.stage_scales.split(',') if x]
+    stage_scheduler = AdaptiveStageScheduler(stage_scales=stage_scales,
+                                             min_batches=args.stage_min_batches,
+                                             cooldown_batches=args.stage_cooldown_batches,
+                                             plateau_tol=args.stage_plateau_tol,
+                                             exploration_prob=args.stage_exploration_prob,
+                                             warmup_batches=args.stage_warmup_batches)
 
     print("Starting training...")
     print(f"Gradient clipping norm: {args.grad_clip_norm if args.grad_clip_norm is not None else 'None'} | "
@@ -45,7 +53,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
             train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm, loss_clamp_value=args.loss_clamp,
                                        plip_teacher_weight=args.plip_teacher_weight, plip_teacher_geom_weight=args.plip_teacher_geom_weight,
-                                       plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing)
+                                       plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing,
+                                       stage_scheduler=stage_scheduler)
             print("Epoch {}: Training loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, train_losses['loss'], train_losses['lddt_loss'], train_losses['affinity_loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                           train_losses['tor_loss'], train_losses['res_tr_loss'], train_losses['res_rot_loss'], train_losses['res_chi_loss']))
@@ -78,7 +87,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
             val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals,
                                    plip_teacher_weight=args.plip_teacher_weight, plip_teacher_geom_weight=args.plip_teacher_geom_weight,
-                                   plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing)
+                                   plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing,
+                                   stage_scheduler=stage_scheduler)
             print("Epoch {}: Validation loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, val_losses['loss'], val_losses['lddt_loss'], val_losses['affinity_loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'],
                             val_losses['res_tr_loss'], val_losses['res_rot_loss'], val_losses['res_chi_loss']))
