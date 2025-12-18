@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-PLIP_CACHE_SCHEMA_VERSION = 1
+PLIP_CACHE_SCHEMA_VERSION = 2
 
 DEFAULT_INTERACTION_TYPES: Sequence[str] = (
     "hydrophobic",
@@ -186,7 +186,16 @@ def extract_plip_interactions(
 
 
 def load_plip_cache(pdbid: str, cache_dir: str) -> Optional[Dict]:
-    """Load a cached PLIP result."""
+    """Load a cached PLIP result.
+
+    Returns
+    -------
+    Optional[Dict]
+        Cache payload with normalized fields. A ``_schema_mismatch`` flag is
+        injected when the on-disk schema version does not match the current
+        :data:`PLIP_CACHE_SCHEMA_VERSION` so that callers can decide whether to
+        fall back to a non-PLIP path.
+    """
     cache_path_json = os.path.join(cache_dir, f"{pdbid}_interactions.json")
     cache_path_pkl = os.path.join(cache_dir, f"{pdbid}_interactions.pkl")
     if os.path.exists(cache_path_json):
@@ -199,10 +208,19 @@ def load_plip_cache(pdbid: str, cache_dir: str) -> Optional[Dict]:
             payload = pickle.load(f)
     else:
         return None
-    # normalize legacy payloads
-    if isinstance(payload, dict) and "interactions" in payload:
-        payload.setdefault("schema_version", 0)
-        payload.setdefault("interaction_types", list(DEFAULT_INTERACTION_TYPES))
+
+    if not isinstance(payload, dict):  # pragma: no cover - defensive guard
+        return None
+
+    payload.setdefault("schema_version", 0)
+    payload.setdefault("interaction_types", list(DEFAULT_INTERACTION_TYPES))
+    if payload["schema_version"] != PLIP_CACHE_SCHEMA_VERSION:
+        warnings.warn(
+            f"PLIP cache schema mismatch for {pdbid}: found {payload['schema_version']}, "
+            f"expected {PLIP_CACHE_SCHEMA_VERSION}. Falling back to legacy compatibility.",
+            stacklevel=2,
+        )
+        payload["_schema_mismatch"] = True
     return payload
 
 
