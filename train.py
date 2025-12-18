@@ -177,11 +177,12 @@ def main_function():
     ema_weights = ExponentialMovingAverage(model.parameters(),decay=args.ema_rate)
     start_epoch = 0
     if args.restart_dir:
+        load_log_path = os.path.join(args.restart_dir, 'load_state_warnings.log')
         try:
             dict = torch.load(f'{args.restart_dir}/last_model.pt', map_location=torch.device('cpu'))
             if args.restart_lr is not None: dict['optimizer']['param_groups'][0]['lr'] = args.restart_lr
             optimizer.load_state_dict(dict['optimizer'])
-            load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict['model'], strict=False)
+            load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict['model'], strict=False, log_path=load_log_path)
             if hasattr(args, 'ema_rate'):
                 ema_weights.load_state_dict(dict['ema_weights'], device=device)
             print("Restarting from epoch", dict['epoch'])
@@ -189,7 +190,7 @@ def main_function():
         except Exception as e:
             print("Exception", e)
             dict = torch.load(f'{args.restart_dir}/best_model.pt', map_location=torch.device('cpu'))
-            load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict, strict=False)
+            load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict, strict=False, log_path=load_log_path)
             print("Due to exception had to take the best epoch and no optimiser")
 
     numel = sum([p.numel() for p in model.parameters()])

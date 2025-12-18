@@ -158,22 +158,66 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
     return model
 
 
-def load_state_dict_flexible(model, state_dict, strict=True):
-    current_state = model.state_dict()
+def load_state_dict_flexible(model, state_dict, strict=True, log_path=None):
+    """
+    A flexible loader that tolerates shape mismatches and module prefixes while surfacing
+    any dropped keys. Missing parameters keep their initialized values, which means EMA
+    tracking will simply start from those initial weights.
+    """
+    parallel_wrappers = (torch.nn.DataParallel, DataParallel)
+    target_model = model.module if isinstance(model, parallel_wrappers) else model
+    current_state = target_model.state_dict()
+
     filtered = {}
     dropped = []
+    renamed = []
     for k, v in state_dict.items():
-        if k in current_state and current_state[k].shape == v.shape:
-            filtered[k] = v
-        else:
+        candidate_keys = [k]
+        if k.startswith('module.'):
+            candidate_keys.append(k[len('module.'):])
+
+        matched = False
+        for candidate in candidate_keys:
+            if candidate in current_state and current_state[candidate].shape == v.shape:
+                filtered[candidate] = v
+                if candidate != k:
+                    renamed.append((k, candidate))
+                matched = True
+                break
+        if not matched:
             dropped.append(k)
+
+    missing_keys, unexpected_keys = target_model.load_state_dict(filtered, strict=False)
+
+    warnings_to_report = []
+    if renamed:
+        warnings_to_report.append(f'Stripped prefixes for {len(renamed)} keys (e.g., {renamed[0][0]} -> {renamed[0][1]}).')
     if dropped:
-        print(f'Ignoring {len(dropped)} mismatched state_dict keys: {dropped[:5]}{"..." if len(dropped)>5 else ""}')
-    missing_keys, unexpected_keys = model.load_state_dict(filtered, strict=False)
+        warnings_to_report.append(f'Ignored {len(dropped)} mismatched keys: {dropped[:5]}{"..." if len(dropped) > 5 else ""}.')
+    if missing_keys:
+        warnings_to_report.append(f'Missing keys after flexible load: {missing_keys}.')
+    if unexpected_keys:
+        warnings_to_report.append(f'Unexpected keys after flexible load: {unexpected_keys}.')
+
+    if warnings_to_report:
+        context_notes = []
+        if isinstance(model, parallel_wrappers):
+            context_notes.append('Model is wrapped in DataParallel; keys were loaded on the underlying module.')
+        context_notes.append('Missing parameters retain initialized values; EMA will track them from initialization.')
+        message = ' '.join(warnings_to_report + context_notes)
+        print(message)
+        if log_path:
+            log_path = os.fspath(log_path)
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            with open(log_path, 'a') as f:
+                f.write(message + '\n')
+
     if strict and (missing_keys or unexpected_keys):
         print(f'Missing keys after flexible load: {missing_keys}')
         print(f'Unexpected keys after flexible load: {unexpected_keys}')
-    return missing_keys, dropped
+    return missing_keys, dropped, unexpected_keys
 
 
 def get_symmetry_rmsd(mol, coords1, coords2, mol2=None):
