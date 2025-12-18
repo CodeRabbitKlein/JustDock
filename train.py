@@ -18,7 +18,7 @@ import yaml
 from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
 from datasets.pdbbind import construct_loader
 from utils.parsing import parse_train_args
-from utils.training import train_epoch, test_epoch, loss_function, finetune_epoch, inference_epoch
+from utils.training import train_epoch, test_epoch, loss_function, finetune_epoch, inference_epoch, AdaptiveStageScheduler
 from utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, ExponentialMovingAverage, load_state_dict_flexible
 
 gpus = list(range(torch.cuda.device_count()))
@@ -32,6 +32,14 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                       tor_weight=args.tor_weight, res_tr_weight=args.res_tr_weight, res_rot_weight=args.res_rot_weight, res_chi_weight=args.res_chi_weight,
                       no_torsion=args.no_torsion, clamp_value=args.loss_clamp)
 
+    stage_scales = [float(x) for x in args.stage_scales.split(',') if x]
+    stage_scheduler = AdaptiveStageScheduler(stage_scales=stage_scales,
+                                             min_batches=args.stage_min_batches,
+                                             cooldown_batches=args.stage_cooldown_batches,
+                                             plateau_tol=args.stage_plateau_tol,
+                                             exploration_prob=args.stage_exploration_prob,
+                                             warmup_batches=args.stage_warmup_batches)
+
     print("Starting training...")
     print(f"Gradient clipping norm: {args.grad_clip_norm if args.grad_clip_norm is not None else 'None'} | "
           f"Loss clamp: {args.loss_clamp if args.loss_clamp is not None else 'None'}")
@@ -43,7 +51,10 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
         if not args.only_test:
 
-            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm, loss_clamp_value=args.loss_clamp)
+            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm, loss_clamp_value=args.loss_clamp,
+                                       plip_teacher_weight=args.plip_teacher_weight, plip_teacher_geom_weight=args.plip_teacher_geom_weight,
+                                       plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing,
+                                       stage_scheduler=stage_scheduler, phys_huber_delta=args.phys_loss_huber_delta)
             print("Epoch {}: Training loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, train_losses['loss'], train_losses['lddt_loss'], train_losses['affinity_loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                           train_losses['tor_loss'], train_losses['res_tr_loss'], train_losses['res_rot_loss'], train_losses['res_chi_loss']))
@@ -74,7 +85,12 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
             ema_weights.store(model.parameters())
             if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
-            val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
+            val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals,
+                                   plip_teacher_weight=args.plip_teacher_weight, plip_teacher_geom_weight=args.plip_teacher_geom_weight,
+                                   plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing,
+                                   stage_scheduler=stage_scheduler, phys_huber_delta=args.phys_loss_huber_delta,
+                                   plip_consistency_threshold=args.plip_consistency_threshold, plip_postprocess_min=args.plip_postprocess_distance_min,
+                                   plip_postprocess_max=args.plip_postprocess_distance_max, plip_postprocess_eval=args.plip_postprocess_eval)
             print("Epoch {}: Validation loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, val_losses['loss'], val_losses['lddt_loss'], val_losses['affinity_loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'],
                             val_losses['res_tr_loss'], val_losses['res_rot_loss'], val_losses['res_chi_loss']))
@@ -132,12 +148,15 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             else:
                 scheduler.step(val_losses['loss'])
 
-        torch.save({
+        checkpoint_payload = {
             'epoch': epoch,
             'model': state_dict,
             'optimizer': optimizer.state_dict(),
             'ema_weights': ema_weights.state_dict(),
-        }, os.path.join(run_dir, 'last_model.pt'))
+        }
+        if stage_scheduler is not None:
+            checkpoint_payload['stage_scheduler'] = stage_scheduler.state_dict()
+        torch.save(checkpoint_payload, os.path.join(run_dir, 'last_model.pt'))
 
     print("Best Validation Loss {} on Epoch {}".format(best_val_loss, best_epoch))
     print("Best inference metric {} on Epoch {}".format(best_val_inference_value, best_val_inference_epoch))
@@ -185,6 +204,9 @@ def main_function():
             load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict['model'], strict=False, log_path=load_log_path)
             if hasattr(args, 'ema_rate'):
                 ema_weights.load_state_dict(dict['ema_weights'], device=device)
+            if 'stage_scheduler' in dict and 'stage_scheduler' in locals():
+                stage_scheduler.load_state_dict(dict['stage_scheduler'])
+                print("Loaded stage scheduler state.")
             print("Restarting from epoch", dict['epoch'])
             start_epoch = dict['epoch'] + 1
         except Exception as e:
