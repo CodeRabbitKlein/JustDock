@@ -63,6 +63,8 @@ def parse_train_args():
     parser.add_argument('--plip_cache_dir', type=str, default='data/cache_plip', help='Directory holding cached PLIP outputs')
     parser.add_argument('--plip_confidence_threshold', type=float, default=0.5, help='Confidence threshold for anchor assignment')
     parser.add_argument('--plip_interaction_types', type=str, default=None, help='Comma separated list of PLIP interaction types to keep')
+    parser.add_argument('--plip_auto_rebuild', action='store_true', default=False, help='Re-run PLIP extraction when caches are missing or invalid')
+    parser.add_argument('--plip_skip_invalid', action='store_true', default=True, help='Skip PLIP attachment when validation fails instead of keeping stale data')
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')
