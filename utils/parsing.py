@@ -69,6 +69,10 @@ def parse_train_args():
     parser.add_argument('--plip_max_interactions_per_ligand_atom', type=int, default=None, help='Maximum PLIP interactions to keep per ligand atom')
     parser.add_argument('--plip_distance_max', type=float, default=None, help='Distance upper bound for PLIP features (values are clamped)')
     parser.add_argument('--plip_min_confidence', type=float, default=None, help='Minimum PLIP interaction confidence to keep')
+    parser.add_argument('--plip_teacher_weight', type=float, default=0.0, help='Weight for PLIP interaction classification supervision')
+    parser.add_argument('--plip_teacher_geom_weight', type=float, default=0.0, help='Weight for PLIP geometry supervision (distance/angle)')
+    parser.add_argument('--plip_teacher_temperature', type=float, default=1.0, help='Temperature for PLIP teacher logits')
+    parser.add_argument('--plip_teacher_label_smoothing', type=float, default=0.0, help='Label smoothing for PLIP interaction classification supervision')
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')

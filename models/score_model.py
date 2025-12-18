@@ -97,7 +97,7 @@ class TensorProductScoreModel(torch.nn.Module):
                  dynamic_max_cross=False, dropout=0.0, lm_embedding_type=None, confidence_mode=False,
                  confidence_dropout=0, confidence_no_batchnorm=False, num_confidence_outputs=1,finetune=False,
                  use_plip=False, use_plip_features=False, plip_num_types=None, plip_distance_embed_dim=16, plip_angle_embed_dim=8,
-                 plip_distance_max=None):
+                 plip_distance_max=None, plip_teacher_temperature=1.0):
         super(TensorProductScoreModel, self).__init__()
         self.finetune = finetune
         self.t_to_sigma = t_to_sigma
@@ -125,6 +125,7 @@ class TensorProductScoreModel(torch.nn.Module):
         self.plip_num_types = plip_num_types if plip_num_types is not None else 0
         self.plip_feature_dim = 0
         self.plip_distance_max = plip_distance_max
+        self.plip_teacher_temperature = plip_teacher_temperature
         self.plip_coverage_log_every = 20000
         self._plip_coverage_state = {'covered': 0.0, 'total': 0}
         if self.use_plip_features and self.plip_num_types > 0:

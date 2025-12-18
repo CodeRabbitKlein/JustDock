@@ -1,4 +1,5 @@
 import copy
+from functools import partial
 
 import numpy as np
 from  scipy.spatial.transform import Rotation
@@ -12,6 +13,7 @@ from utils import so3, torus
 from utils.sampling import randomize_position, sampling
 import torch
 from utils.diffusion_utils import get_t_schedule, set_time
+import torch.nn.functional as F
 
 from torch_scatter import scatter_mean
 
@@ -202,9 +204,63 @@ class AverageMeter():
             return out
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None, loss_clamp_value=None):
+def _compute_plip_teacher_losses(data, cls_weight=0.0, geom_weight=0.0, temperature=1.0, label_smoothing=0.0, device=None):
+    if cls_weight == 0.0 and geom_weight == 0.0:
+        return 0.0, 0.0, 0.0, 0
+    if not isinstance(data, list):
+        return 0.0, 0.0, 0.0, 0
+
+    logit_list, target_types, geom_preds, geom_targets = [], [], [], []
+    matched_edges = 0
+
+    for graph in data:
+        preds = getattr(graph, 'cross_edge_predictions', None)
+        if preds is None or 'edge_index' not in preds:
+            continue
+        if not hasattr(graph, 'plip_pair_to_index') or not hasattr(graph, 'plip_interactions'):
+            continue
+        pair_to_idx = graph.plip_pair_to_index
+        interactions = graph.plip_interactions
+        edge_index = preds['edge_index']
+        logits = preds['logits'] if 'logits' in preds else None
+        geom_pred = preds['geometry'] if 'geometry' in preds else None
+        if logits is None or geom_pred is None:
+            continue
+        for edge_idx, (lig_idx, rec_idx) in enumerate(zip(edge_index[0].tolist(), edge_index[1].tolist())):
+            key = (int(lig_idx), int(rec_idx))
+            if key not in pair_to_idx:
+                continue
+            inter_idx = pair_to_idx[key]
+            logit_list.append(logits[edge_idx])
+            geom_preds.append(geom_pred[edge_idx])
+            target_types.append(interactions['type'][inter_idx].to(logits.device))
+            geom_targets.append(torch.stack([
+                interactions['distance'][inter_idx],
+                interactions['angle'][inter_idx],
+            ]).to(geom_pred.device))
+            matched_edges += 1
+
+    if len(logit_list) == 0:
+        return 0.0, 0.0, 0.0, 0
+
+    logit_tensor = torch.stack(logit_list)
+    target_tensor = torch.stack(target_types).long().to(logit_tensor.device)
+    cls_loss = F.cross_entropy(logit_tensor / max(temperature, 1e-6), target_tensor, label_smoothing=label_smoothing) * cls_weight
+
+    geom_loss = 0.0
+    if geom_weight > 0.0 and len(geom_preds) > 0:
+        geom_pred_tensor = torch.stack(geom_preds).to(logit_tensor.device)
+        geom_target_tensor = torch.stack(geom_targets).to(logit_tensor.device)
+        geom_loss = F.smooth_l1_loss(geom_pred_tensor, geom_target_tensor) * geom_weight
+
+    total = cls_loss + geom_loss
+    return total, cls_loss.detach(), geom_loss if isinstance(geom_loss, torch.Tensor) else torch.tensor(geom_loss), matched_edges
+
+
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None, loss_clamp_value=None,
+                plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0):
     model.train()
-    meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss'])
+    meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'])
     skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0, 'singleton_batch': 0}
     clamp_tracker = {}
 
@@ -221,13 +277,26 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
                 loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune, clamp_tracker=clamp_tracker)
+            plip_teacher_loss, plip_cls_loss, plip_geom_loss, plip_matched_edges = _compute_plip_teacher_losses(
+                data,
+                cls_weight=plip_teacher_weight,
+                geom_weight=plip_teacher_geom_weight,
+                temperature=plip_teacher_temperature,
+                label_smoothing=plip_teacher_label_smoothing,
+                device=device,
+            )
+            loss = loss + plip_teacher_loss
             # with torch.autograd.detect_anomaly():
             loss.backward()
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             ema_weights.update(model.parameters())
-            meter.add([loss.cpu().detach(), lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss])
+            meter.add([loss.cpu().detach(), lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss,
+                       plip_teacher_loss if torch.is_tensor(plip_teacher_loss) else torch.tensor(plip_teacher_loss),
+                       plip_cls_loss if torch.is_tensor(plip_cls_loss) else torch.tensor(plip_cls_loss),
+                       plip_geom_loss if torch.is_tensor(plip_geom_loss) else torch.tensor(plip_geom_loss),
+                       torch.tensor(float(plip_matched_edges))])
             train_loss += loss.item()
             train_num += 1
             bar.set_description('loss: %.4f' % (train_loss/train_num))
@@ -295,9 +364,10 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     return summary
 
 
-def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
+def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False,
+               plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0):
     model.eval()
-    meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss'],
+    meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'],
                          unpooled_metrics=True)
 
     if test_sigma_intervals:
@@ -315,8 +385,20 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
 
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
                 loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device, clamp_tracker=clamp_tracker)
-            # print(loss)
-            meter.add([loss.cpu().detach(), lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss])
+            plip_teacher_loss, plip_cls_loss, plip_geom_loss, plip_matched_edges = _compute_plip_teacher_losses(
+                data if isinstance(data, list) else [data],
+                cls_weight=plip_teacher_weight,
+                geom_weight=plip_teacher_geom_weight,
+                temperature=plip_teacher_temperature,
+                label_smoothing=plip_teacher_label_smoothing,
+                device=device,
+            )
+            loss = loss + plip_teacher_loss
+            meter.add([loss.cpu().detach(), lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss,
+                       plip_teacher_loss if torch.is_tensor(plip_teacher_loss) else torch.tensor(plip_teacher_loss),
+                       plip_cls_loss if torch.is_tensor(plip_cls_loss) else torch.tensor(plip_cls_loss),
+                       plip_geom_loss if torch.is_tensor(plip_geom_loss) else torch.tensor(plip_geom_loss),
+                       torch.tensor(float(plip_matched_edges))])
 
             if test_sigma_intervals > 0:
                 complex_t_tr, complex_t_rot, complex_t_tor, complex_t_res_tr, complex_t_res_rot, complex_t_res_chi = [torch.cat([d.complex_t[noise_type] for d in data]) for
