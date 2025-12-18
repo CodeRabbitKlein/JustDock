@@ -16,8 +16,9 @@ from utils.diffusion_utils import get_t_schedule, set_time
 from torch_scatter import scatter_mean
 
 def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data, t_to_sigma, device, lddt_weight=1, affinity_weight=1, tr_weight=1, rot_weight=1,
-                  tor_weight=1, res_tr_weight=1, res_rot_weight=1, res_chi_weight=1, apply_mean=True, no_torsion=False, train_score=False, finetune=False):
+                  tor_weight=1, res_tr_weight=1, res_rot_weight=1, res_chi_weight=1, apply_mean=True, no_torsion=False, train_score=False, finetune=False, clamp_value=None):
     mean_dims = (0, 1) if apply_mean else 1
+    clamp_fn = (lambda x: torch.clamp(x, max=clamp_value)) if clamp_value is not None else (lambda x: x)
     if finetune:
         affinity = torch.cat([d.affinity for d in data], dim=0) if device.type == 'cuda' else data.affinity
         affinity_loss = ((affinity_pred.cpu() - affinity) ** 2).mean(dim=mean_dims) * 100.
@@ -36,12 +37,12 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     # lddt and affinity component
     lddt = torch.cat([d.lddt for d in data], dim=0) if device.type == 'cuda' else data.lddt
 
-    lddt_loss = ((lddt_pred.cpu() - lddt) ** 2).mean(dim=mean_dims)
+    lddt_loss = clamp_fn(((lddt_pred.cpu() - lddt) ** 2).mean(dim=mean_dims))
     lddt_base_loss = (lddt ** 2).mean(dim=mean_dims).detach()
     # native_mask = (lddt > 0.9).float()
     affinity = torch.cat([d.affinity for d in data], dim=0) if device.type == 'cuda' else data.affinity
     affinity_mask = (affinity != -1).float()
-    affinity_loss = ((((affinity_pred.cpu() - affinity) ** 2)*affinity_mask) / (affinity_mask+1e-6)).mean(dim=mean_dims)
+    affinity_loss = clamp_fn(((((affinity_pred.cpu() - affinity) ** 2)*affinity_mask) / (affinity_mask+1e-6)).mean(dim=mean_dims))
     # affinity_loss = (((affinity_pred.cpu() - affinity) ** 2 * native_mask + torch.nn.ReLU()(affinity_pred.cpu() - affinity + 1.) ** 2 * (1.-native_mask))).mean(dim=mean_dims)
     affinity_base_loss = (((affinity ** 2)*affinity_mask) / (affinity_mask+1e-6)).mean(dim=mean_dims)
 
@@ -56,7 +57,7 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     # translation component
     tr_score = torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' else data.tr_score
     tr_sigma = tr_sigma.unsqueeze(-1)
-    tr_loss = ((tr_pred.cpu() - tr_score) ** 2 / tr_sigma ** 2).mean(dim=mean_dims)
+    tr_loss = clamp_fn(((tr_pred.cpu() - tr_score) ** 2 / tr_sigma ** 2).mean(dim=mean_dims))
     tr_base_loss = (tr_score ** 2 / tr_sigma ** 2).mean(dim=mean_dims).detach()
 
 
@@ -71,7 +72,7 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     rot_loss = torch.minimum(rot_loss_pos,rot_loss_neg)
 
     if apply_mean:
-        rot_loss = rot_loss.mean()
+        rot_loss = clamp_fn(rot_loss.mean())
     rot_loss = rot_loss
     rot_base_loss = ((rot_score / rot_sigma[...,None]) ** 2).mean(dim=mean_dims).detach()
 
@@ -84,7 +85,7 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
         tor_loss = ((1-(tor_pred.cpu() - tor_score).cos()) / (edge_tor_sigma/np.pi))
         tor_base_loss = ((1-(tor_score).cos()) / (edge_tor_sigma/np.pi))
         if apply_mean:
-            tor_loss, tor_base_loss = tor_loss.mean() * torch.ones(1, dtype=torch.float), tor_base_loss.mean() * torch.ones(1, dtype=torch.float)
+            tor_loss, tor_base_loss = clamp_fn(tor_loss.mean()) * torch.ones(1, dtype=torch.float), clamp_fn(tor_base_loss.mean()) * torch.ones(1, dtype=torch.float)
         else:
             index = torch.cat([torch.ones(d['ligand'].edge_mask.sum()) * i for i, d in
                                enumerate(data)]).long() if device.type == 'cuda' else data['ligand'].batch[
@@ -116,8 +117,8 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     res_tr_loss = torch.nn.L1Loss(reduction='none')(res_tr_pred.cpu(),res_tr_score).mean(dim=1) * res_loss_weight.squeeze(1) * 3.0#((res_tr_pred.cpu() - res_tr_score) ** 2).mean(dim=mean_dims)
     res_tr_base_loss = (res_tr_score).abs().mean(dim=1).detach() * res_loss_weight.squeeze(1) * 3.0
     if apply_mean:
-        res_tr_loss = res_tr_loss.mean()
-        res_tr_base_loss = res_tr_base_loss.mean()
+        res_tr_loss = clamp_fn(res_tr_loss.mean())
+        res_tr_base_loss = clamp_fn(res_tr_base_loss.mean())
 
     # local rotation component
     res_rot_score = torch.cat([d.res_rot_score for d in data], dim=0) if device.type == 'cuda' else data.res_rot_score
@@ -131,8 +132,8 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     res_rot_loss = res_rot_loss_pos * res_loss_weight.squeeze(1) * 15.0
     res_rot_base_loss = (res_rot_score.abs()).mean(dim=1).detach() * res_loss_weight.squeeze(1) * 15.0
     if apply_mean:
-        res_rot_loss = res_rot_loss.mean()
-        res_rot_base_loss = res_rot_base_loss.mean()
+        res_rot_loss = clamp_fn(res_rot_loss.mean())
+        res_rot_base_loss = clamp_fn(res_rot_base_loss.mean())
 
     res_chi_score = torch.cat([d.res_chi_score for d in data], dim=0) if device.type == 'cuda' else data.res_chi_score
     res_chi_mask = torch.cat([d['receptor'].chi_masks for d in data], dim=0) if device.type == 'cuda' else data['receptor'].chi_masks
@@ -144,6 +145,9 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     res_chi_loss[res_chi_symmetry_mask] = torch.minimum(res_chi_loss[res_chi_symmetry_mask],res_chi_symmetry_loss[res_chi_symmetry_mask])
     res_chi_loss = (res_chi_loss*res_loss_weight*res_chi_mask).sum(dim=mean_dims) / (res_chi_mask.sum(dim=mean_dims)+1e-12) * 3.0
     res_chi_base_loss = ((1-(res_chi_score).cos())*res_loss_weight*res_chi_mask).sum(dim=mean_dims) / (res_chi_mask.sum(dim=mean_dims).detach()+1e-12) * 3.0
+    if apply_mean:
+        res_chi_loss = clamp_fn(res_chi_loss)
+        res_chi_base_loss = clamp_fn(res_chi_base_loss)
     if not apply_mean:
         rec_batch = torch.cat([torch.tensor([i]*d['receptor'].num_nodes) for i,d in enumerate(data)], dim=0) if device.type == 'cuda' else data['receptor'].batch
         res_tr_loss = scatter_mean(res_tr_loss, rec_batch)
@@ -191,7 +195,7 @@ class AverageMeter():
             return out
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False):
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None):
     model.train()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss'])
 
@@ -208,6 +212,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune)
             # with torch.autograd.detect_anomaly():
             loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             ema_weights.update(model.parameters())
             meter.add([loss.cpu().detach(), lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss])

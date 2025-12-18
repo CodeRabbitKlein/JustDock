@@ -19,7 +19,7 @@ from utils.diffusion_utils import t_to_sigma as t_to_sigma_compl
 from datasets.pdbbind import construct_loader
 from utils.parsing import parse_train_args
 from utils.training import train_epoch, test_epoch, loss_function, finetune_epoch, inference_epoch
-from utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, ExponentialMovingAverage
+from utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, ExponentialMovingAverage, load_state_dict_flexible
 
 gpus = list(range(torch.cuda.device_count()))
 print('Available GPU count:',len(gpus))
@@ -30,7 +30,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
     best_val_inference_epoch = 0
     loss_fn = partial(loss_function, lddt_weight=args.lddt_weight, affinity_weight=args.affinity_weight, tr_weight=args.tr_weight, rot_weight=args.rot_weight,
                       tor_weight=args.tor_weight, res_tr_weight=args.res_tr_weight, res_rot_weight=args.res_rot_weight, res_chi_weight=args.res_chi_weight,
-                      no_torsion=args.no_torsion)
+                      no_torsion=args.no_torsion, clamp_value=args.loss_clamp)
 
     print("Starting training...")
     for epoch in range(args.n_epochs):
@@ -41,7 +41,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
         if not args.only_test:
 
-            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights)
+            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm)
             print("Epoch {}: Training loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, train_losses['loss'], train_losses['lddt_loss'], train_losses['affinity_loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                           train_losses['tor_loss'], train_losses['res_tr_loss'], train_losses['res_rot_loss'], train_losses['res_chi_loss']))
@@ -153,6 +153,9 @@ def main_function():
             else:
                 arg_dict[key] = value
         args.config = args.config.name
+    if getattr(args, 'use_plip_features', False) and not args.use_plip:
+        print('use_plip_features requested - enabling use_plip for dataset compatibility.')
+        args.use_plip = True
     assert (args.inference_earlystop_goal == 'max' or args.inference_earlystop_goal == 'min')
     if args.val_inference_freq is not None and args.scheduler is not None:
         assert (args.scheduler_patience > args.val_inference_freq) # otherwise we will just stop training after args.scheduler_patience epochs
@@ -176,7 +179,7 @@ def main_function():
             dict = torch.load(f'{args.restart_dir}/last_model.pt', map_location=torch.device('cpu'))
             if args.restart_lr is not None: dict['optimizer']['param_groups'][0]['lr'] = args.restart_lr
             optimizer.load_state_dict(dict['optimizer'])
-            model.module.load_state_dict(dict['model'], strict=True)
+            load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict['model'], strict=False)
             if hasattr(args, 'ema_rate'):
                 ema_weights.load_state_dict(dict['ema_weights'], device=device)
             print("Restarting from epoch", dict['epoch'])
@@ -184,7 +187,7 @@ def main_function():
         except Exception as e:
             print("Exception", e)
             dict = torch.load(f'{args.restart_dir}/best_model.pt', map_location=torch.device('cpu'))
-            model.module.load_state_dict(dict, strict=True)
+            load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict, strict=False)
             print("Due to exception had to take the best epoch and no optimiser")
 
     numel = sum([p.numel() for p in model.parameters()])

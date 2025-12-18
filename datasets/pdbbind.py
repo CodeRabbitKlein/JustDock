@@ -28,6 +28,9 @@ from utils.diffusion_utils import modify_conformer, set_time
 from utils.utils import read_strings_from_txt
 from utils import so3, torus
 
+CACHE_SCHEMA_VERSION = 1
+
+
 
 
 class NoiseTransform(BaseTransform):
@@ -125,6 +128,9 @@ class PDBBind(Dataset):
         self.plip_cache_dir = plip_cache_dir
         self.plip_confidence_threshold = plip_confidence_threshold
         self.plip_interaction_types = plip_interaction_types if plip_interaction_types is not None else list(DEFAULT_INTERACTION_TYPES)
+        self.cache_failures = defaultdict(list)
+        self.plip_index_anomalies = []
+        self._rebuilt_cache = False
         if matching or protein_path_list is not None and ligand_descriptions is not None:
             cache_path += '_torsion'
         if all_atoms:
@@ -144,31 +150,94 @@ class PDBBind(Dataset):
         self.center_ligand = center_ligand
         self.all_atoms = all_atoms
         self.atom_radius, self.atom_max_neighbors = atom_radius, atom_max_neighbors
-        if (not use_existing_cache) or (not os.path.exists(os.path.join(self.full_cache_path, "heterographs.pkl"))\
-                or (require_ligand and not os.path.exists(os.path.join(self.full_cache_path, "rdkit_ligands.pkl")))):
+        hetero_path = os.path.join(self.full_cache_path, "heterographs.pkl")
+        rdkit_path = os.path.join(self.full_cache_path, "rdkit_ligands.pkl")
+        receptor_path = os.path.join(self.full_cache_path, "receptor_pdbs.pkl")
+        if (not use_existing_cache) or (not os.path.exists(hetero_path)\
+                or (require_ligand and not os.path.exists(rdkit_path))):
             os.makedirs(self.full_cache_path, exist_ok=True)
             if protein_path_list is None or ligand_descriptions is None:
                 self.preprocessing()
             else:
                 self.inference_preprocessing()
 
-        print('loading data from memory: ', os.path.join(self.full_cache_path, "heterographs.pkl"))
-        with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'rb') as f:
-            self.complex_graphs = pickle.load(f)
+        print('loading data from memory: ', hetero_path)
+        try:
+            self.complex_graphs, hetero_meta = self._load_cache(hetero_path, 'heterographs')
+        except Exception as e:
+            self._maybe_rebuild_cache(f'heterograph load failure: {e}')
+            self.complex_graphs, hetero_meta = self._load_cache(hetero_path, 'heterographs')
         for g in self.complex_graphs:
             self._ensure_anchor_fields(g)
             if self.use_plip and hasattr(g, 'name'):
                 self._apply_plip_interactions(g, g.name)
         if require_ligand:
-            with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
-                self.rdkit_ligands = pickle.load(f)
+            try:
+                self.rdkit_ligands, _ = self._load_cache(rdkit_path, 'rdkit_ligands')
+            except Exception as e:
+                self._maybe_rebuild_cache(f'ligand cache load failure: {e}')
+                self.rdkit_ligands, _ = self._load_cache(rdkit_path, 'rdkit_ligands')
         if require_receptor:
-            with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'rb') as f:
-                self.receptor_pdbs = pickle.load(f)
+            try:
+                self.receptor_pdbs, _ = self._load_cache(receptor_path, 'receptor_pdbs')
+            except Exception as e:
+                self._maybe_rebuild_cache(f'receptor cache load failure: {e}')
+                self.receptor_pdbs, _ = self._load_cache(receptor_path, 'receptor_pdbs')
         print_statistics(self.complex_graphs)
 
     def len(self):
         return len(self.complex_graphs)
+
+    # Cache helpers
+    def _cache_metadata(self):
+        return {
+            'schema_version': CACHE_SCHEMA_VERSION,
+            'use_plip': self.use_plip,
+            'plip_interaction_types': list(self.plip_interaction_types),
+        }
+
+    def _save_cache(self, path, payload):
+        wrapped = {'metadata': self._cache_metadata(), 'data': payload}
+        with open(path, 'wb') as f:
+            pickle.dump(wrapped, f)
+
+    def _load_cache(self, path, description):
+        try:
+            with open(path, 'rb') as f:
+                obj = pickle.load(f)
+        except Exception as e:
+            self.cache_failures['io'].append((description, str(e)))
+            raise
+        metadata = {}
+        data = obj
+        if isinstance(obj, dict) and 'data' in obj:
+            data = obj.get('data')
+            metadata = obj.get('metadata', {})
+        self._validate_cache_metadata(metadata, description)
+        return data, metadata
+
+    def _validate_cache_metadata(self, metadata, description):
+        if not metadata:
+            # legacy cache
+            self.cache_failures['legacy'].append(description)
+            return
+        if metadata.get('schema_version') != CACHE_SCHEMA_VERSION:
+            raise ValueError(f'{description} cache schema mismatch: expected {CACHE_SCHEMA_VERSION}, got {metadata.get("schema_version")}')
+        if self.use_plip:
+            cached_types = metadata.get('plip_interaction_types')
+            if cached_types is not None and set(cached_types) != set(self.plip_interaction_types):
+                raise ValueError(f'{description} cache PLIP types mismatch: expected {self.plip_interaction_types}, got {cached_types}')
+
+    def _maybe_rebuild_cache(self, reason):
+        if self._rebuilt_cache:
+            return
+        print(f'Attempting to rebuild cache due to: {reason}')
+        os.makedirs(self.full_cache_path, exist_ok=True)
+        if self.protein_path_list is None or self.ligand_descriptions is None:
+            self.preprocessing()
+        else:
+            self.inference_preprocessing()
+        self._rebuilt_cache = True
 
     def get(self, idx):
         complex_graph = copy.deepcopy(self.complex_graphs[idx])
@@ -193,14 +262,22 @@ class PDBBind(Dataset):
         if cache is None or cache.get('interactions') is None:
             print(f'PLIP cache missing for {name}, skipping PLIP features.')
             return
+        cached_types = cache.get('interaction_types')
+        if cached_types is not None and set(cached_types) != set(self.plip_interaction_types):
+            print(f'PLIP cache interaction types mismatch for {name}: cache has {cached_types}, expected {self.plip_interaction_types}.')
+        lig_count = complex_graph['ligand'].num_nodes
+        rec_count = complex_graph['receptor'].num_nodes
         lig_idxs, rec_idxs, types, distances, angles, directions, confidences = [], [], [], [], [], [], []
+        invalid_entries = []
         for entry in cache.get('interactions', []):
             try:
                 lig_idx = int(entry.get('lig_atom_idx'))
                 rec_idx = int(entry.get('rec_residue_idx'))
             except Exception:
+                invalid_entries.append(entry)
                 continue
-            if lig_idx >= complex_graph['ligand'].num_nodes or rec_idx >= complex_graph['receptor'].num_nodes:
+            if lig_idx >= lig_count or rec_idx >= rec_count or lig_idx < 0 or rec_idx < 0:
+                invalid_entries.append({'lig': lig_idx, 'rec': rec_idx})
                 continue
             interaction_type = entry.get('interaction_type', 'misc')
             if interaction_type not in self.plip_interaction_types:
@@ -215,6 +292,9 @@ class PDBBind(Dataset):
                 direction = [0.0, 0.0, 0.0]
             directions.append(direction)
             confidences.append(float(entry.get('confidence', 1.0)))
+        if invalid_entries:
+            self.plip_index_anomalies.append({'name': name, 'invalid': len(invalid_entries), 'total': len(cache.get('interactions', [])), 'lig_nodes': lig_count, 'rec_nodes': rec_count})
+            print(f'PLIP cache index mismatch for {name}: {len(invalid_entries)} invalid interactions skipped (lig_nodes={lig_count}, rec_nodes={rec_count}).')
         if len(lig_idxs) == 0:
             return
         edge_index = torch.tensor([lig_idxs, rec_idxs], dtype=torch.long)
@@ -282,10 +362,8 @@ class PDBBind(Dataset):
         #     rdkit_ligands.extend(t[1])
             # pbar.update()
 
-        with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
-            pickle.dump((complex_graphs), f)
-        with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-            pickle.dump((rdkit_ligands), f)
+        self._save_cache(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), complex_graphs)
+        self._save_cache(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), rdkit_ligands)
 
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
@@ -331,19 +409,15 @@ class PDBBind(Dataset):
 
             complex_graphs_all = []
             for i in range(len(complex_names_all)//self.parallel_count+1):
-                with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'rb') as f:
-                    l = pickle.load(f)
-                    complex_graphs_all.extend(l)
-            with open(os.path.join(self.full_cache_path, f"heterographs.pkl"), 'wb') as f:
-                pickle.dump((complex_graphs_all), f)
+                l, _ = self._load_cache(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), f"heterographs_split_{i}")
+                complex_graphs_all.extend(l)
+            self._save_cache(os.path.join(self.full_cache_path, f"heterographs.pkl"), complex_graphs_all)
 
             rdkit_ligands_all = []
             for i in range(len(complex_names_all) // self.parallel_count + 1):
-                with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'rb') as f:
-                    l = pickle.load(f)
-                    rdkit_ligands_all.extend(l)
-            with open(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands_all), f)
+                l, _ = self._load_cache(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), f"rdkit_split_{i}")
+                rdkit_ligands_all.extend(l)
+            self._save_cache(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), rdkit_ligands_all)
         else:
             complex_graphs, rdkit_ligands = [], []
             with tqdm(total=len(complex_names_all), desc='loading complexes') as pbar:
@@ -351,10 +425,8 @@ class PDBBind(Dataset):
                     complex_graphs.extend(t[0])
                     rdkit_ligands.extend(t[1])
                     pbar.update()
-            with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'wb') as f:
-                pickle.dump((complex_graphs), f)
-            with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
+            self._save_cache(os.path.join(self.full_cache_path, "heterographs.pkl"), complex_graphs)
+            self._save_cache(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), rdkit_ligands)
 
     def inference_preprocessing(self):
         ligands_list = []
@@ -425,26 +497,20 @@ class PDBBind(Dataset):
                         pbar.update()
                 if self.num_workers > 1: p.__exit__(None, None, None)
 
-                with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
-                    pickle.dump((complex_graphs), f)
-                with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                    pickle.dump((rdkit_ligands), f)
+                self._save_cache(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), complex_graphs)
+                self._save_cache(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), rdkit_ligands)
 
             complex_graphs_all = []
             for i in range(len(self.protein_path_list)//self.parallel_count+1):
-                with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'rb') as f:
-                    l = pickle.load(f)
-                    complex_graphs_all.extend(l)
-            with open(os.path.join(self.full_cache_path, f"heterographs.pkl"), 'wb') as f:
-                pickle.dump((complex_graphs_all), f)
+                l, _ = self._load_cache(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), f"heterographs_split_{i}")
+                complex_graphs_all.extend(l)
+            self._save_cache(os.path.join(self.full_cache_path, f"heterographs.pkl"), complex_graphs_all)
 
             rdkit_ligands_all = []
             for i in range(len(self.protein_path_list) // self.parallel_count + 1):
-                with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'rb') as f:
-                    l = pickle.load(f)
-                    rdkit_ligands_all.extend(l)
-            with open(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands_all), f)
+                l, _ = self._load_cache(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), f"rdkit_split_{i}")
+                rdkit_ligands_all.extend(l)
+            self._save_cache(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), rdkit_ligands_all)
         else:
             complex_graphs, rdkit_ligands, receptor_pdbs = [], [], []
             with tqdm(total=len(self.protein_path_list), desc='loading complexes') as pbar:
@@ -453,12 +519,9 @@ class PDBBind(Dataset):
                     rdkit_ligands.extend(t[1])
                     receptor_pdbs.extend(t[2])
                     pbar.update()
-            with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'wb') as f:
-                pickle.dump((complex_graphs), f)
-            with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
-            with open(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), 'wb') as f:
-                pickle.dump((receptor_pdbs), f)
+            self._save_cache(os.path.join(self.full_cache_path, "heterographs.pkl"), complex_graphs)
+            self._save_cache(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), rdkit_ligands)
+            self._save_cache(os.path.join(self.full_cache_path, "receptor_pdbs.pkl"), receptor_pdbs)
 
     def get_complex(self, par):
         name, protein_path, lm_embedding_chains, ligand, receptor_pdb, ligand_description = par
@@ -569,6 +632,7 @@ class PDBBindScoring(Dataset):
         self.plip_cache_dir = plip_cache_dir
         self.plip_confidence_threshold = plip_confidence_threshold
         self.plip_interaction_types = plip_interaction_types if plip_interaction_types is not None else list(DEFAULT_INTERACTION_TYPES)
+        self.cache_failures = defaultdict(list)
         if matching or protein_path_list is not None and ligand_descriptions is not None:
             cache_path += '_torsion'
         if all_atoms:
@@ -643,6 +707,30 @@ class PDBBindScoring(Dataset):
             complex_graph.rec_pdb = copy.deepcopy(self.receptor_pdbs[complex_graph.protein_path])
         return complex_graph
 
+    def _cache_metadata(self):
+        return {
+            'schema_version': CACHE_SCHEMA_VERSION,
+            'use_plip': self.use_plip,
+            'plip_interaction_types': list(self.plip_interaction_types),
+        }
+
+    def _save_cache(self, path, payload):
+        wrapped = {'metadata': self._cache_metadata(), 'data': payload}
+        with open(path, 'wb') as f:
+            pickle.dump(wrapped, f)
+
+    def _load_cache(self, path, description):
+        with open(path, 'rb') as f:
+            obj = pickle.load(f)
+        metadata = {}
+        data = obj
+        if isinstance(obj, dict) and 'data' in obj:
+            data = obj.get('data')
+            metadata = obj.get('metadata', {})
+        if metadata.get('schema_version') not in (None, CACHE_SCHEMA_VERSION):
+            raise ValueError(f'{description} cache schema mismatch: {metadata.get("schema_version")}')
+        return data, metadata
+
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
 
@@ -683,26 +771,20 @@ class PDBBindScoring(Dataset):
                         pbar.update()
                 if self.num_workers > 1: p.__exit__(None, None, None)
 
-                with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
-                    pickle.dump((complex_graphs), f)
-                with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                    pickle.dump((rdkit_ligands), f)
+                self._save_cache(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), complex_graphs)
+                self._save_cache(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), rdkit_ligands)
 
             complex_graphs_all = []
             for i in range(len(complex_names_all)//1000+1):
-                with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'rb') as f:
-                    l = pickle.load(f)
-                    complex_graphs_all.extend(l)
-            with open(os.path.join(self.full_cache_path, f"heterographs.pkl"), 'wb') as f:
-                pickle.dump((complex_graphs_all), f)
+                l, _ = self._load_cache(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), f"heterographs_split_{i}")
+                complex_graphs_all.extend(l)
+            self._save_cache(os.path.join(self.full_cache_path, f"heterographs.pkl"), complex_graphs_all)
 
             rdkit_ligands_all = []
             for i in range(len(complex_names_all) // 1000 + 1):
-                with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'rb') as f:
-                    l = pickle.load(f)
-                    rdkit_ligands_all.extend(l)
-            with open(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands_all), f)
+                l, _ = self._load_cache(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), f"rdkit_split_{i}")
+                rdkit_ligands_all.extend(l)
+            self._save_cache(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), rdkit_ligands_all)
         else:
             complex_graphs, rdkit_ligands = [], []
             with tqdm(total=len(complex_names_all), desc='loading complexes') as pbar:
@@ -710,10 +792,8 @@ class PDBBindScoring(Dataset):
                     complex_graphs.extend(t[0])
                     rdkit_ligands.extend(t[1])
                     pbar.update()
-            with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'wb') as f:
-                pickle.dump((complex_graphs), f)
-            with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
+            self._save_cache(os.path.join(self.full_cache_path, "heterographs.pkl"), complex_graphs)
+            self._save_cache(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), rdkit_ligands)
 
     def inference_preprocessing(self):
         receptor_pdbs = {}
@@ -786,26 +866,20 @@ class PDBBindScoring(Dataset):
                         pbar.update()
                 if self.num_workers > 1: p.__exit__(None, None, None)
 
-                with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
-                    pickle.dump((complex_graphs), f)
-                with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
-                    pickle.dump((rdkit_ligands), f)
+                self._save_cache(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), complex_graphs)
+                self._save_cache(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), rdkit_ligands)
 
             complex_graphs_all = []
             for i in range(len(self.protein_path_list)//1000+1):
-                with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'rb') as f:
-                    l = pickle.load(f)
-                    complex_graphs_all.extend(l)
-            with open(os.path.join(self.full_cache_path, f"heterographs.pkl"), 'wb') as f:
-                pickle.dump((complex_graphs_all), f)
+                l, _ = self._load_cache(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), f"heterographs_split_{i}")
+                complex_graphs_all.extend(l)
+            self._save_cache(os.path.join(self.full_cache_path, f"heterographs.pkl"), complex_graphs_all)
 
             rdkit_ligands_all = []
             for i in range(len(self.protein_path_list) // 1000 + 1):
-                with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'rb') as f:
-                    l = pickle.load(f)
-                    rdkit_ligands_all.extend(l)
-            with open(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands_all), f)
+                l, _ = self._load_cache(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), f"rdkit_split_{i}")
+                rdkit_ligands_all.extend(l)
+            self._save_cache(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), rdkit_ligands_all)
         else:
 
             ligand_graphs, rdkit_ligands = [], []

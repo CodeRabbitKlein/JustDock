@@ -7,6 +7,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+PLIP_CACHE_SCHEMA_VERSION = 1
+
 DEFAULT_INTERACTION_TYPES: Sequence[str] = (
     "hydrophobic",
     "hbond",
@@ -171,15 +173,15 @@ def extract_plip_interactions(
     complex_obj.analyze()
     interactions = _extract_interactions_from_complex(complex_obj, pdbid)
 
+    payload = {
+        "pdbid": pdbid,
+        "num_interactions": len(interactions),
+        "interactions": [inter.to_dict() for inter in interactions],
+        "schema_version": PLIP_CACHE_SCHEMA_VERSION,
+        "interaction_types": list(DEFAULT_INTERACTION_TYPES),
+    }
     with open(output_path, "w") as f:
-        json.dump(
-            {
-                "pdbid": pdbid,
-                "num_interactions": len(interactions),
-                "interactions": [inter.to_dict() for inter in interactions],
-            },
-            f,
-        )
+        json.dump(payload, f)
     return output_path
 
 
@@ -189,13 +191,19 @@ def load_plip_cache(pdbid: str, cache_dir: str) -> Optional[Dict]:
     cache_path_pkl = os.path.join(cache_dir, f"{pdbid}_interactions.pkl")
     if os.path.exists(cache_path_json):
         with open(cache_path_json, "r") as f:
-            return json.load(f)
-    if os.path.exists(cache_path_pkl):  # pragma: no cover - backwards compatibility
+            payload = json.load(f)
+    elif os.path.exists(cache_path_pkl):  # pragma: no cover - backwards compatibility
         import pickle
 
         with open(cache_path_pkl, "rb") as f:
-            return pickle.load(f)
-    return None
+            payload = pickle.load(f)
+    else:
+        return None
+    # normalize legacy payloads
+    if isinstance(payload, dict) and "interactions" in payload:
+        payload.setdefault("schema_version", 0)
+        payload.setdefault("interaction_types", list(DEFAULT_INTERACTION_TYPES))
+    return payload
 
 
 def batch_extract(
@@ -222,6 +230,7 @@ def batch_extract(
 
 
 __all__ = [
+    "PLIP_CACHE_SCHEMA_VERSION",
     "DEFAULT_INTERACTION_TYPES",
     "PlipInteraction",
     "batch_extract",
