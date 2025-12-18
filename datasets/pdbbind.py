@@ -7,6 +7,7 @@ from collections import defaultdict
 from multiprocessing import Pool
 import random
 import copy
+import math
 import pandas as pd
 import numpy as np
 # from biopandas.pdb import PandasPdb
@@ -110,7 +111,8 @@ class PDBBind(Dataset):
                  atom_radius=5, atom_max_neighbors=None, esm_embeddings_path=None, require_ligand=False, require_receptor=False,
                  ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=False, use_existing_cache=True,
                  use_plip=False, plip_cache_dir='data/cache_plip', plip_confidence_threshold=0.5, plip_interaction_types=None,
-                 plip_auto_rebuild=False, plip_skip_invalid=True):
+                 plip_auto_rebuild=False, plip_skip_invalid=True, plip_max_interactions_per_residue=None,
+                 plip_max_interactions_per_ligand_atom=None, plip_distance_max=None, plip_min_confidence=None):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
@@ -140,6 +142,10 @@ class PDBBind(Dataset):
         self._rebuilt_cache = False
         self.plip_auto_rebuild = plip_auto_rebuild
         self.plip_skip_invalid = plip_skip_invalid
+        self.plip_max_interactions_per_residue = plip_max_interactions_per_residue
+        self.plip_max_interactions_per_ligand_atom = plip_max_interactions_per_ligand_atom
+        self.plip_distance_max = plip_distance_max
+        self.plip_min_confidence = plip_min_confidence
         self._plip_disabled = False
         self._plip_disable_reason = None
         self._plip_rebuild_attempted = set()
@@ -344,6 +350,56 @@ class PDBBind(Dataset):
             self.plip_index_anomalies.append({'name': name, 'invalid': len(invalid_entries), 'total': len(cache.get('interactions', [])), 'lig_nodes': lig_count, 'rec_nodes': rec_count})
         return normalized, invalid_entries
 
+    def _filter_plip_interactions(self, interactions):
+        stats = defaultdict(int)
+        filtered = []
+        clipped_flags = []
+        res_counts = defaultdict(int)
+        lig_counts = defaultdict(int)
+        max_per_res = self.plip_max_interactions_per_residue
+        max_per_lig = self.plip_max_interactions_per_ligand_atom
+        distance_cap = self.plip_distance_max
+        min_conf = self.plip_min_confidence
+
+        for entry in interactions:
+            stats['total_before'] += 1
+            if min_conf is not None and entry['confidence'] < min_conf:
+                stats['dropped_low_conf'] += 1
+                continue
+            if distance_cap is not None and entry['distance'] > distance_cap:
+                stats['dropped_distance'] += 1
+                continue
+            if max_per_res is not None and res_counts[entry['rec_residue_idx']] >= max_per_res:
+                stats['dropped_max_residue'] += 1
+                continue
+            if max_per_lig is not None and lig_counts[entry['lig_atom_idx']] >= max_per_lig:
+                stats['dropped_max_ligand'] += 1
+                continue
+
+            clipped = False
+            if distance_cap is not None:
+                if entry['distance'] > distance_cap:
+                    clipped = True
+                entry['distance'] = min(entry['distance'], distance_cap)
+            entry['angle'] = max(0.0, min(float(entry['angle']), math.pi))
+            direction = np.asarray(entry.get('direction', [0.0, 0.0, 0.0]), dtype=float)
+            norm = np.linalg.norm(direction)
+            if norm > 0:
+                direction = direction / max(norm, 1.0)
+            direction = np.clip(direction, -1.0, 1.0)
+            if norm > 1.0 or np.any((direction < -1.0) | (direction > 1.0)):
+                clipped = True
+            entry['direction'] = direction.tolist()
+
+            filtered.append(entry)
+            clipped_flags.append(clipped)
+            res_counts[entry['rec_residue_idx']] += 1
+            lig_counts[entry['lig_atom_idx']] += 1
+
+        stats['kept'] = len(filtered)
+        stats['clipped'] = int(sum(clipped_flags))
+        return filtered, stats, clipped_flags
+
     def _load_validated_plip_cache(self, name, lig_count, rec_count):
         if self._plip_disabled:
             return None
@@ -403,8 +459,12 @@ class PDBBind(Dataset):
         cache = self._load_validated_plip_cache(name, lig_count, rec_count)
         if cache is None or cache.get('interactions') is None:
             return
+        filtered, clip_stats, clipped_flags = self._filter_plip_interactions(cache.get('interactions', []))
+        if len(filtered) == 0:
+            self.plip_bad_samples.append({'name': name, 'reason': 'no valid interactions after filtering'})
+            return
         lig_idxs, rec_idxs, types, distances, angles, directions, confidences = [], [], [], [], [], [], []
-        for entry in cache.get('interactions', []):
+        for entry in filtered:
             interaction_type = entry.get('interaction_type', 'misc')
             if interaction_type not in self.plip_interaction_types:
                 continue
@@ -425,6 +485,7 @@ class PDBBind(Dataset):
         complex_graph.plip_angle = torch.tensor(angles, dtype=torch.float32)
         complex_graph.plip_direction = torch.tensor(directions, dtype=torch.float32)
         complex_graph.plip_confidence = torch.tensor(confidences, dtype=torch.float32)
+        complex_graph.plip_clipped_mask = torch.tensor(clipped_flags, dtype=torch.bool)
         complex_graph.plip_interactions = {
             'edge_index': edge_index,
             'type': complex_graph.plip_type,
@@ -432,7 +493,9 @@ class PDBBind(Dataset):
             'angle': complex_graph.plip_angle,
             'direction': complex_graph.plip_direction,
             'confidence': complex_graph.plip_confidence,
+            'clipped_mask': complex_graph.plip_clipped_mask,
         }
+        complex_graph.plip_clip_info = dict(clip_stats)
         # anchor masks
         lig_anchor = complex_graph['ligand'].anchor_mask.clone()
         rec_anchor = complex_graph['receptor'].anchor_mask.clone()
@@ -1093,7 +1156,11 @@ def construct_loader(args, t_to_sigma):
                    'plip_confidence_threshold': args.plip_confidence_threshold,
                    'plip_interaction_types': args.plip_interaction_types.split(',') if args.plip_interaction_types else None,
                    'plip_auto_rebuild': getattr(args, 'plip_auto_rebuild', False),
-                   'plip_skip_invalid': getattr(args, 'plip_skip_invalid', True)}
+                   'plip_skip_invalid': getattr(args, 'plip_skip_invalid', True),
+                   'plip_max_interactions_per_residue': getattr(args, 'plip_max_interactions_per_residue', None),
+                   'plip_max_interactions_per_ligand_atom': getattr(args, 'plip_max_interactions_per_ligand_atom', None),
+                   'plip_distance_max': getattr(args, 'plip_distance_max', None),
+                   'plip_min_confidence': getattr(args, 'plip_min_confidence', None)}
     info=pd.read_csv(args.info_path,dtype={'gap_mask':str})
     train_dataset = PDBBind(info=info,cache_path=args.cache_path, split_path=args.split_train, keep_original=True,
                             num_conformers=args.num_conformers, **common_args)

@@ -65,6 +65,10 @@ def parse_train_args():
     parser.add_argument('--plip_interaction_types', type=str, default=None, help='Comma separated list of PLIP interaction types to keep')
     parser.add_argument('--plip_auto_rebuild', action='store_true', default=False, help='Re-run PLIP extraction when caches are missing or invalid')
     parser.add_argument('--plip_skip_invalid', action='store_true', default=True, help='Skip PLIP attachment when validation fails instead of keeping stale data')
+    parser.add_argument('--plip_max_interactions_per_residue', type=int, default=None, help='Maximum PLIP interactions to keep per receptor residue')
+    parser.add_argument('--plip_max_interactions_per_ligand_atom', type=int, default=None, help='Maximum PLIP interactions to keep per ligand atom')
+    parser.add_argument('--plip_distance_max', type=float, default=None, help='Distance upper bound for PLIP features (values are clamped)')
+    parser.add_argument('--plip_min_confidence', type=float, default=None, help='Minimum PLIP interaction confidence to keep')
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')
