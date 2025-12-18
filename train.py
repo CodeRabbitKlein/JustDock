@@ -33,6 +33,8 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                       no_torsion=args.no_torsion, clamp_value=args.loss_clamp)
 
     print("Starting training...")
+    print(f"Gradient clipping norm: {args.grad_clip_norm if args.grad_clip_norm is not None else 'None'} | "
+          f"Loss clamp: {args.loss_clamp if args.loss_clamp is not None else 'None'}")
     for epoch in range(args.n_epochs):
         if epoch < start_epoch:
             continue
@@ -41,7 +43,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
 
         if not args.only_test:
 
-            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm)
+            train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm, loss_clamp_value=args.loss_clamp)
             print("Epoch {}: Training loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, train_losses['loss'], train_losses['lddt_loss'], train_losses['affinity_loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                           train_losses['tor_loss'], train_losses['res_tr_loss'], train_losses['res_rot_loss'], train_losses['res_chi_loss']))
