@@ -1,4 +1,5 @@
 import math
+import warnings
 
 from e3nn import o3
 import torch
@@ -134,6 +135,7 @@ class TensorProductScoreModel(torch.nn.Module):
         self.rec_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
 
         cross_edge_in_dim = sigma_embed_dim + cross_distance_embed_dim + self.plip_feature_dim
+        self.cross_edge_in_dim = cross_edge_in_dim
         self.cross_edge_embedding = nn.Sequential(nn.Linear(cross_edge_in_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
 
         self.lig_distance_expansion = GaussianSmearing(0.0, lig_max_radius, distance_embed_dim)
@@ -504,6 +506,20 @@ class TensorProductScoreModel(torch.nn.Module):
         plip_attr = self._encode_plip_features(data, src, dst)
         if plip_attr is not None:
             edge_attr = torch.cat([edge_attr, plip_attr], 1)
+        if edge_attr.shape[1] != self.cross_edge_in_dim:
+            if edge_attr.shape[1] > self.cross_edge_in_dim:
+                warnings.warn(
+                    f'Cross edge features have {edge_attr.shape[1]} dims but model expects {self.cross_edge_in_dim}; truncating extras.',
+                    stacklevel=2
+                )
+                edge_attr = edge_attr[:, :self.cross_edge_in_dim]
+            else:
+                warnings.warn(
+                    f'Cross edge features have {edge_attr.shape[1]} dims but model expects {self.cross_edge_in_dim}; padding zeros for compatibility.',
+                    stacklevel=2
+                )
+                padding = edge_attr.new_zeros((edge_attr.shape[0], self.cross_edge_in_dim - edge_attr.shape[1]))
+                edge_attr = torch.cat([edge_attr, padding], 1)
         edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
 
         return edge_index, edge_attr, edge_sh
