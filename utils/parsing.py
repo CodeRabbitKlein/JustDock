@@ -57,6 +57,10 @@ def parse_train_args():
     parser.add_argument('--remove_hs', action='store_true', default=False, help='remove Hs')
     parser.add_argument('--num_conformers', type=int, default=1, help='Number of conformers to match to each ligand')
     parser.add_argument('--esm_embeddings_path', type=str, default=None, help='If this is set then the LM embeddings at that path will be used for the receptor features')
+    parser.add_argument('--use_plip', action='store_true', default=False, help='Enable PLIP interaction features')
+    parser.add_argument('--plip_cache_dir', type=str, default='data/cache_plip', help='Directory holding cached PLIP outputs')
+    parser.add_argument('--plip_confidence_threshold', type=float, default=0.5, help='Confidence threshold for anchor assignment')
+    parser.add_argument('--plip_interaction_types', type=str, default=None, help='Comma separated list of PLIP interaction types to keep')
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')

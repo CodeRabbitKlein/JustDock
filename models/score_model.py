@@ -94,7 +94,8 @@ class TensorProductScoreModel(torch.nn.Module):
                  center_max_distance=30, distance_embed_dim=32, cross_distance_embed_dim=32, no_torsion=False,
                  scale_by_sigma=True, use_second_order_repr=False, batch_norm=True,
                  dynamic_max_cross=False, dropout=0.0, lm_embedding_type=None, confidence_mode=False,
-                 confidence_dropout=0, confidence_no_batchnorm=False, num_confidence_outputs=1,finetune=False):
+                 confidence_dropout=0, confidence_no_batchnorm=False, num_confidence_outputs=1,finetune=False,
+                 use_plip=False, plip_num_types=None, plip_distance_embed_dim=16, plip_angle_embed_dim=8):
         super(TensorProductScoreModel, self).__init__()
         self.finetune = finetune
         self.t_to_sigma = t_to_sigma
@@ -117,6 +118,13 @@ class TensorProductScoreModel(torch.nn.Module):
         self.timestep_emb_func = timestep_emb_func
         self.confidence_mode = confidence_mode
         self.num_conv_layers = num_conv_layers
+        self.use_plip = use_plip
+        self.plip_num_types = plip_num_types if plip_num_types is not None else 0
+        self.plip_feature_dim = 0
+        if self.use_plip and self.plip_num_types > 0:
+            self.plip_distance_expansion = GaussianSmearing(0.0, cross_max_distance, plip_distance_embed_dim)
+            self.plip_angle_expansion = GaussianSmearing(0.0, math.pi, plip_angle_embed_dim)
+            self.plip_feature_dim = plip_distance_embed_dim + plip_angle_embed_dim + self.plip_num_types + 5  # direction(3) + confidence + mask
 
         self.lig_node_embedding = AtomEncoder(emb_dim=ns, feature_dims=lig_feature_dims, sigma_embed_dim=sigma_embed_dim)
         self.lig_edge_embedding = nn.Sequential(nn.Linear(in_lig_edge_features + sigma_embed_dim + distance_embed_dim, ns),nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
@@ -124,11 +132,21 @@ class TensorProductScoreModel(torch.nn.Module):
         self.rec_node_embedding = AtomEncoder(emb_dim=ns, feature_dims=rec_residue_feature_dims, sigma_embed_dim=sigma_embed_dim, lm_embedding_type=lm_embedding_type)
         self.rec_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
 
-        self.cross_edge_embedding = nn.Sequential(nn.Linear(sigma_embed_dim + cross_distance_embed_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
+        cross_edge_in_dim = sigma_embed_dim + cross_distance_embed_dim + self.plip_feature_dim
+        self.cross_edge_embedding = nn.Sequential(nn.Linear(cross_edge_in_dim, ns), nn.ReLU(), nn.Dropout(dropout),nn.Linear(ns, ns))
 
         self.lig_distance_expansion = GaussianSmearing(0.0, lig_max_radius, distance_embed_dim)
         self.rec_distance_expansion = GaussianSmearing(0.0, rec_max_radius, distance_embed_dim)
         self.cross_distance_expansion = GaussianSmearing(0.0, cross_max_distance, cross_distance_embed_dim)
+        if self.use_plip and self.plip_num_types > 0:
+            self.cross_readout = nn.Sequential(
+                nn.Linear(3 * ns, ns),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(ns, self.plip_num_types + 2)
+            )
+        else:
+            self.cross_readout = None
 
         if use_second_order_repr:
             irrep_seq = [
@@ -285,6 +303,12 @@ class TensorProductScoreModel(torch.nn.Module):
         cross_edge_index, cross_edge_attr, cross_edge_sh = self.build_cross_conv_graph(data, cross_cutoff)
         cross_lig, cross_rec = cross_edge_index
         cross_edge_attr = self.cross_edge_embedding(cross_edge_attr)
+        if self.cross_readout is not None:
+            edge_repr = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], dim=-1)
+            cross_pred = self.cross_readout(edge_repr)
+            interaction_logits = cross_pred[:, :self.plip_num_types]
+            geom_pred = cross_pred[:, self.plip_num_types:]
+            data.cross_edge_predictions = {'logits': interaction_logits, 'geometry': geom_pred, 'edge_index': cross_edge_index}
 
         for l in range(len(self.lig_conv_layers)):
 
@@ -476,6 +500,9 @@ class TensorProductScoreModel(torch.nn.Module):
         edge_length_emb = self.cross_distance_expansion(edge_vec.norm(dim=-1))
         edge_sigma_emb = data['ligand'].node_sigma_emb[src.long()]
         edge_attr = torch.cat([edge_sigma_emb, edge_length_emb], 1)
+        plip_attr = self._encode_plip_features(data, src, dst)
+        if plip_attr is not None:
+            edge_attr = torch.cat([edge_attr, plip_attr], 1)
         edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
 
         return edge_index, edge_attr, edge_sh
@@ -509,6 +536,46 @@ class TensorProductScoreModel(torch.nn.Module):
         edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
 
         return bonds, edge_index, edge_attr, edge_sh
+
+    def _encode_plip_features(self, data, lig_indices, rec_indices):
+        if not self.use_plip or self.plip_feature_dim == 0:
+            return None
+        device = data['ligand'].x.device
+        num_edges = lig_indices.shape[0]
+        features = torch.zeros((num_edges, self.plip_feature_dim), device=device)
+        if not hasattr(data, 'plip_interactions') or not hasattr(data, 'plip_pair_to_index'):
+            return features
+        interactions = data.plip_interactions
+        pair_to_idx = data.plip_pair_to_index
+        for i, (lig_idx, rec_idx) in enumerate(zip(lig_indices.tolist(), rec_indices.tolist())):
+            key = (int(lig_idx), int(rec_idx))
+            if key not in pair_to_idx:
+                continue
+            inter_idx = pair_to_idx[key]
+            dist_val = interactions['distance'][inter_idx].to(device)
+            angle_val = interactions['angle'][inter_idx].to(device)
+            type_val = interactions['type'][inter_idx].to(device)
+            direction_val = interactions['direction'][inter_idx].to(device)
+            conf_val = interactions['confidence'][inter_idx].to(device)
+            dist_emb = self.plip_distance_expansion(dist_val)
+            angle_emb = self.plip_angle_expansion(angle_val)
+            type_one_hot = (
+                F.one_hot(type_val, num_classes=self.plip_num_types).float()
+                if self.plip_num_types > 0
+                else torch.zeros(0, device=device)
+            )
+            features[i] = torch.cat(
+                [
+                    dist_emb,
+                    angle_emb,
+                    type_one_hot,
+                    direction_val,
+                    conf_val.view(1),
+                    torch.ones(1, device=device),
+                ],
+                dim=0,
+            )
+        return features
 
 
 class GaussianSmearing(torch.nn.Module):
