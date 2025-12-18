@@ -96,7 +96,8 @@ class TensorProductScoreModel(torch.nn.Module):
                  scale_by_sigma=True, use_second_order_repr=False, batch_norm=True,
                  dynamic_max_cross=False, dropout=0.0, lm_embedding_type=None, confidence_mode=False,
                  confidence_dropout=0, confidence_no_batchnorm=False, num_confidence_outputs=1,finetune=False,
-                 use_plip=False, use_plip_features=False, plip_num_types=None, plip_distance_embed_dim=16, plip_angle_embed_dim=8):
+                 use_plip=False, use_plip_features=False, plip_num_types=None, plip_distance_embed_dim=16, plip_angle_embed_dim=8,
+                 plip_distance_max=None, plip_teacher_temperature=1.0):
         super(TensorProductScoreModel, self).__init__()
         self.finetune = finetune
         self.t_to_sigma = t_to_sigma
@@ -123,6 +124,10 @@ class TensorProductScoreModel(torch.nn.Module):
         self.use_plip_features = use_plip_features and use_plip
         self.plip_num_types = plip_num_types if plip_num_types is not None else 0
         self.plip_feature_dim = 0
+        self.plip_distance_max = plip_distance_max
+        self.plip_teacher_temperature = plip_teacher_temperature
+        self.plip_coverage_log_every = 20000
+        self._plip_coverage_state = {'covered': 0.0, 'total': 0}
         if self.use_plip_features and self.plip_num_types > 0:
             self.plip_distance_expansion = GaussianSmearing(0.0, cross_max_distance, plip_distance_embed_dim)
             self.plip_angle_expansion = GaussianSmearing(0.0, math.pi, plip_angle_embed_dim)
@@ -570,9 +575,17 @@ class TensorProductScoreModel(torch.nn.Module):
                 continue
             inter_idx = pair_to_idx[key]
             dist_val = interactions['distance'][inter_idx].to(device)
+            if self.plip_distance_max is not None:
+                dist_val = torch.clamp(dist_val, max=self.plip_distance_max)
             angle_val = interactions['angle'][inter_idx].to(device)
+            angle_val = torch.clamp(angle_val, min=0.0, max=math.pi)
             type_val = interactions['type'][inter_idx].to(device)
             direction_val = interactions['direction'][inter_idx].to(device)
+            if direction_val.dim() == 1 and direction_val.numel() == 3:
+                norm = torch.linalg.norm(direction_val)
+                if norm > 0:
+                    direction_val = direction_val / torch.clamp(norm, min=1.0)
+                direction_val = direction_val.clamp(min=-1.0, max=1.0)
             conf_val = interactions['confidence'][inter_idx].to(device)
             dist_emb = self.plip_distance_expansion(dist_val)
             angle_emb = self.plip_angle_expansion(angle_val)
@@ -592,7 +605,23 @@ class TensorProductScoreModel(torch.nn.Module):
                 ],
                 dim=0,
             )
+        mask = features[:, -1]
+        if mask.numel() > 0:
+            data.plip_edge_coverage = mask.mean().item()
+            self._record_plip_coverage(mask)
         return features
+
+    def _record_plip_coverage(self, mask_tensor):
+        total = int(mask_tensor.numel())
+        covered = float(mask_tensor.sum().item())
+        state = self._plip_coverage_state
+        state['covered'] += covered
+        state['total'] += total
+        if state['total'] >= self.plip_coverage_log_every and state['total'] > 0:
+            ratio = state['covered'] / state['total'] if state['total'] else 0.0
+            print(f'PLIP coverage running average: {ratio:.3f} ({int(state["covered"])} / {int(state["total"])} edges)')
+            state['covered'] = 0.0
+            state['total'] = 0
 
 
 class GaussianSmearing(torch.nn.Module):
