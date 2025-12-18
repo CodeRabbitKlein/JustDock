@@ -95,7 +95,7 @@ class TensorProductScoreModel(torch.nn.Module):
                  scale_by_sigma=True, use_second_order_repr=False, batch_norm=True,
                  dynamic_max_cross=False, dropout=0.0, lm_embedding_type=None, confidence_mode=False,
                  confidence_dropout=0, confidence_no_batchnorm=False, num_confidence_outputs=1,finetune=False,
-                 use_plip=False, plip_num_types=None, plip_distance_embed_dim=16, plip_angle_embed_dim=8):
+                 use_plip=False, use_plip_features=False, plip_num_types=None, plip_distance_embed_dim=16, plip_angle_embed_dim=8):
         super(TensorProductScoreModel, self).__init__()
         self.finetune = finetune
         self.t_to_sigma = t_to_sigma
@@ -119,9 +119,10 @@ class TensorProductScoreModel(torch.nn.Module):
         self.confidence_mode = confidence_mode
         self.num_conv_layers = num_conv_layers
         self.use_plip = use_plip
+        self.use_plip_features = use_plip_features and use_plip
         self.plip_num_types = plip_num_types if plip_num_types is not None else 0
         self.plip_feature_dim = 0
-        if self.use_plip and self.plip_num_types > 0:
+        if self.use_plip_features and self.plip_num_types > 0:
             self.plip_distance_expansion = GaussianSmearing(0.0, cross_max_distance, plip_distance_embed_dim)
             self.plip_angle_expansion = GaussianSmearing(0.0, math.pi, plip_angle_embed_dim)
             self.plip_feature_dim = plip_distance_embed_dim + plip_angle_embed_dim + self.plip_num_types + 5  # direction(3) + confidence + mask
@@ -138,7 +139,7 @@ class TensorProductScoreModel(torch.nn.Module):
         self.lig_distance_expansion = GaussianSmearing(0.0, lig_max_radius, distance_embed_dim)
         self.rec_distance_expansion = GaussianSmearing(0.0, rec_max_radius, distance_embed_dim)
         self.cross_distance_expansion = GaussianSmearing(0.0, cross_max_distance, cross_distance_embed_dim)
-        if self.use_plip and self.plip_num_types > 0:
+        if self.use_plip_features and self.plip_num_types > 0:
             self.cross_readout = nn.Sequential(
                 nn.Linear(3 * ns, ns),
                 nn.ReLU(),
@@ -538,7 +539,7 @@ class TensorProductScoreModel(torch.nn.Module):
         return bonds, edge_index, edge_attr, edge_sh
 
     def _encode_plip_features(self, data, lig_indices, rec_indices):
-        if not self.use_plip or self.plip_feature_dim == 0:
+        if not self.use_plip_features or self.plip_feature_dim == 0:
             return None
         device = data['ligand'].x.device
         num_edges = lig_indices.shape[0]

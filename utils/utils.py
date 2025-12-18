@@ -100,7 +100,19 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
     lm_embedding_type = None
     if args.esm_embeddings_path is not None: lm_embedding_type = 'esm'
     plip_types = args.plip_interaction_types.split(',') if args.plip_interaction_types else list(DEFAULT_INTERACTION_TYPES)
-    plip_num_types = len(plip_types) if args.use_plip else 0
+    plip_feat_dims = {'distance': 16, 'angle': 8}
+    if getattr(args, 'plip_feat_dims', None):
+        for token in args.plip_feat_dims.split(','):
+            if '=' not in token:
+                continue
+            k, v = token.split('=')
+            if k.strip() in plip_feat_dims:
+                try:
+                    plip_feat_dims[k.strip()] = int(v)
+                except ValueError:
+                    print(f'Could not parse plip_feat_dims token {token}, keeping default.')
+    use_plip_features = getattr(args, 'use_plip_features', False) and args.use_plip
+    plip_num_types = len(plip_types) if use_plip_features else 0
 
     model = model_class(t_to_sigma=t_to_sigma,
                         device=device,
@@ -124,12 +136,33 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                             args.rmsd_classification_cutoff) + 1 if 'rmsd_classification_cutoff' in args and isinstance(
                             args.rmsd_classification_cutoff, list) else 1,
                         use_plip=args.use_plip,
-                        plip_num_types=plip_num_types)
+                        use_plip_features=use_plip_features,
+                        plip_num_types=plip_num_types,
+                        plip_distance_embed_dim=plip_feat_dims['distance'],
+                        plip_angle_embed_dim=plip_feat_dims['angle'])
 
     if device.type == 'cuda' and not no_parallel:
         model = DataParallel(model)
     model.to(device)
     return model
+
+
+def load_state_dict_flexible(model, state_dict, strict=True):
+    current_state = model.state_dict()
+    filtered = {}
+    dropped = []
+    for k, v in state_dict.items():
+        if k in current_state and current_state[k].shape == v.shape:
+            filtered[k] = v
+        else:
+            dropped.append(k)
+    if dropped:
+        print(f'Ignoring {len(dropped)} mismatched state_dict keys: {dropped[:5]}{"..." if len(dropped)>5 else ""}')
+    missing_keys, unexpected_keys = model.load_state_dict(filtered, strict=False)
+    if strict and (missing_keys or unexpected_keys):
+        print(f'Missing keys after flexible load: {missing_keys}')
+        print(f'Unexpected keys after flexible load: {unexpected_keys}')
+    return missing_keys, dropped
 
 
 def get_symmetry_rmsd(mol, coords1, coords2, mol2=None):
