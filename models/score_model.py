@@ -123,6 +123,8 @@ class TensorProductScoreModel(torch.nn.Module):
         self.use_plip_features = use_plip_features and use_plip
         self.plip_num_types = plip_num_types if plip_num_types is not None else 0
         self.plip_feature_dim = 0
+        self.plip_coverage_log_every = 20000
+        self._plip_coverage_state = {'covered': 0.0, 'total': 0}
         if self.use_plip_features and self.plip_num_types > 0:
             self.plip_distance_expansion = GaussianSmearing(0.0, cross_max_distance, plip_distance_embed_dim)
             self.plip_angle_expansion = GaussianSmearing(0.0, math.pi, plip_angle_embed_dim)
@@ -592,7 +594,23 @@ class TensorProductScoreModel(torch.nn.Module):
                 ],
                 dim=0,
             )
+        mask = features[:, -1]
+        if mask.numel() > 0:
+            data.plip_edge_coverage = mask.mean().item()
+            self._record_plip_coverage(mask)
         return features
+
+    def _record_plip_coverage(self, mask_tensor):
+        total = int(mask_tensor.numel())
+        covered = float(mask_tensor.sum().item())
+        state = self._plip_coverage_state
+        state['covered'] += covered
+        state['total'] += total
+        if state['total'] >= self.plip_coverage_log_every and state['total'] > 0:
+            ratio = state['covered'] / state['total'] if state['total'] else 0.0
+            print(f'PLIP coverage running average: {ratio:.3f} ({int(state["covered"])} / {int(state["total"])} edges)')
+            state['covered'] = 0.0
+            state['total'] = 0
 
 
 class GaussianSmearing(torch.nn.Module):
