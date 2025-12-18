@@ -16,9 +16,16 @@ from utils.diffusion_utils import get_t_schedule, set_time
 from torch_scatter import scatter_mean
 
 def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data, t_to_sigma, device, lddt_weight=1, affinity_weight=1, tr_weight=1, rot_weight=1,
-                  tor_weight=1, res_tr_weight=1, res_rot_weight=1, res_chi_weight=1, apply_mean=True, no_torsion=False, train_score=False, finetune=False, clamp_value=None):
+                  tor_weight=1, res_tr_weight=1, res_rot_weight=1, res_chi_weight=1, apply_mean=True, no_torsion=False, train_score=False, finetune=False, clamp_value=None, clamp_tracker=None):
     mean_dims = (0, 1) if apply_mean else 1
-    clamp_fn = (lambda x: torch.clamp(x, max=clamp_value)) if clamp_value is not None else (lambda x: x)
+
+    def track_and_clamp(value, name):
+        if clamp_value is None:
+            return value
+        clamped_value = torch.clamp(value, max=clamp_value)
+        if clamp_tracker is not None and torch.any(value.detach() > clamp_value):
+            clamp_tracker[name] = clamp_tracker.get(name, 0) + 1
+        return clamped_value
     if finetune:
         affinity = torch.cat([d.affinity for d in data], dim=0) if device.type == 'cuda' else data.affinity
         affinity_loss = ((affinity_pred.cpu() - affinity) ** 2).mean(dim=mean_dims) * 100.
@@ -37,12 +44,12 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     # lddt and affinity component
     lddt = torch.cat([d.lddt for d in data], dim=0) if device.type == 'cuda' else data.lddt
 
-    lddt_loss = clamp_fn(((lddt_pred.cpu() - lddt) ** 2).mean(dim=mean_dims))
+    lddt_loss = track_and_clamp(((lddt_pred.cpu() - lddt) ** 2).mean(dim=mean_dims), 'lddt_loss')
     lddt_base_loss = (lddt ** 2).mean(dim=mean_dims).detach()
     # native_mask = (lddt > 0.9).float()
     affinity = torch.cat([d.affinity for d in data], dim=0) if device.type == 'cuda' else data.affinity
     affinity_mask = (affinity != -1).float()
-    affinity_loss = clamp_fn(((((affinity_pred.cpu() - affinity) ** 2)*affinity_mask) / (affinity_mask+1e-6)).mean(dim=mean_dims))
+    affinity_loss = track_and_clamp(((((affinity_pred.cpu() - affinity) ** 2)*affinity_mask) / (affinity_mask+1e-6)).mean(dim=mean_dims), 'affinity_loss')
     # affinity_loss = (((affinity_pred.cpu() - affinity) ** 2 * native_mask + torch.nn.ReLU()(affinity_pred.cpu() - affinity + 1.) ** 2 * (1.-native_mask))).mean(dim=mean_dims)
     affinity_base_loss = (((affinity ** 2)*affinity_mask) / (affinity_mask+1e-6)).mean(dim=mean_dims)
 
@@ -57,7 +64,7 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     # translation component
     tr_score = torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' else data.tr_score
     tr_sigma = tr_sigma.unsqueeze(-1)
-    tr_loss = clamp_fn(((tr_pred.cpu() - tr_score) ** 2 / tr_sigma ** 2).mean(dim=mean_dims))
+    tr_loss = track_and_clamp(((tr_pred.cpu() - tr_score) ** 2 / tr_sigma ** 2).mean(dim=mean_dims), 'tr_loss')
     tr_base_loss = (tr_score ** 2 / tr_sigma ** 2).mean(dim=mean_dims).detach()
 
 
@@ -72,7 +79,7 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     rot_loss = torch.minimum(rot_loss_pos,rot_loss_neg)
 
     if apply_mean:
-        rot_loss = clamp_fn(rot_loss.mean())
+        rot_loss = track_and_clamp(rot_loss.mean(), 'rot_loss')
     rot_loss = rot_loss
     rot_base_loss = ((rot_score / rot_sigma[...,None]) ** 2).mean(dim=mean_dims).detach()
 
@@ -85,7 +92,7 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
         tor_loss = ((1-(tor_pred.cpu() - tor_score).cos()) / (edge_tor_sigma/np.pi))
         tor_base_loss = ((1-(tor_score).cos()) / (edge_tor_sigma/np.pi))
         if apply_mean:
-            tor_loss, tor_base_loss = clamp_fn(tor_loss.mean()) * torch.ones(1, dtype=torch.float), clamp_fn(tor_base_loss.mean()) * torch.ones(1, dtype=torch.float)
+            tor_loss, tor_base_loss = track_and_clamp(tor_loss.mean(), 'tor_loss') * torch.ones(1, dtype=torch.float), track_and_clamp(tor_base_loss.mean(), 'tor_base_loss') * torch.ones(1, dtype=torch.float)
         else:
             index = torch.cat([torch.ones(d['ligand'].edge_mask.sum()) * i for i, d in
                                enumerate(data)]).long() if device.type == 'cuda' else data['ligand'].batch[
@@ -117,8 +124,8 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     res_tr_loss = torch.nn.L1Loss(reduction='none')(res_tr_pred.cpu(),res_tr_score).mean(dim=1) * res_loss_weight.squeeze(1) * 3.0#((res_tr_pred.cpu() - res_tr_score) ** 2).mean(dim=mean_dims)
     res_tr_base_loss = (res_tr_score).abs().mean(dim=1).detach() * res_loss_weight.squeeze(1) * 3.0
     if apply_mean:
-        res_tr_loss = clamp_fn(res_tr_loss.mean())
-        res_tr_base_loss = clamp_fn(res_tr_base_loss.mean())
+        res_tr_loss = track_and_clamp(res_tr_loss.mean(), 'res_tr_loss')
+        res_tr_base_loss = track_and_clamp(res_tr_base_loss.mean(), 'res_tr_base_loss')
 
     # local rotation component
     res_rot_score = torch.cat([d.res_rot_score for d in data], dim=0) if device.type == 'cuda' else data.res_rot_score
@@ -132,8 +139,8 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     res_rot_loss = res_rot_loss_pos * res_loss_weight.squeeze(1) * 15.0
     res_rot_base_loss = (res_rot_score.abs()).mean(dim=1).detach() * res_loss_weight.squeeze(1) * 15.0
     if apply_mean:
-        res_rot_loss = clamp_fn(res_rot_loss.mean())
-        res_rot_base_loss = clamp_fn(res_rot_base_loss.mean())
+        res_rot_loss = track_and_clamp(res_rot_loss.mean(), 'res_rot_loss')
+        res_rot_base_loss = track_and_clamp(res_rot_base_loss.mean(), 'res_rot_base_loss')
 
     res_chi_score = torch.cat([d.res_chi_score for d in data], dim=0) if device.type == 'cuda' else data.res_chi_score
     res_chi_mask = torch.cat([d['receptor'].chi_masks for d in data], dim=0) if device.type == 'cuda' else data['receptor'].chi_masks
@@ -146,8 +153,8 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     res_chi_loss = (res_chi_loss*res_loss_weight*res_chi_mask).sum(dim=mean_dims) / (res_chi_mask.sum(dim=mean_dims)+1e-12) * 3.0
     res_chi_base_loss = ((1-(res_chi_score).cos())*res_loss_weight*res_chi_mask).sum(dim=mean_dims) / (res_chi_mask.sum(dim=mean_dims).detach()+1e-12) * 3.0
     if apply_mean:
-        res_chi_loss = clamp_fn(res_chi_loss)
-        res_chi_base_loss = clamp_fn(res_chi_base_loss)
+        res_chi_loss = track_and_clamp(res_chi_loss, 'res_chi_loss')
+        res_chi_base_loss = track_and_clamp(res_chi_base_loss, 'res_chi_base_loss')
     if not apply_mean:
         rec_batch = torch.cat([torch.tensor([i]*d['receptor'].num_nodes) for i,d in enumerate(data)], dim=0) if device.type == 'cuda' else data['receptor'].batch
         res_tr_loss = scatter_mean(res_tr_loss, rec_batch)
@@ -195,9 +202,11 @@ class AverageMeter():
             return out
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None):
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None, loss_clamp_value=None):
     model.train()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss'])
+    skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0, 'singleton_batch': 0}
+    clamp_tracker = {}
 
     bar = tqdm(loader, total=len(loader))
     train_loss = 0.0
@@ -205,11 +214,13 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
     for data in bar:
         if device.type == 'cuda' and len(data) == 1 or device.type == 'cpu' and data.num_graphs == 1:
             print("Skipping batch of size 1 since otherwise batchnorm would not work.")
+            skip_counts['singleton_batch'] += 1
+            continue
         optimizer.zero_grad()
         try:
             lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
-                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune)
+                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune, clamp_tracker=clamp_tracker)
             # with torch.autograd.detect_anomaly():
             loss.backward()
             if grad_clip is not None:
@@ -222,6 +233,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             bar.set_description('loss: %.4f' % (train_loss/train_num))
         except RuntimeError as e:
             if 'out of memory' in str(e):
+                skip_counts['oom'] += 1
                 print('| WARNING: ran out of memory, skipping batch')
                 for p in model.parameters():
                     if p.grad is not None:
@@ -235,6 +247,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 torch.cuda.empty_cache()
                 continue
             elif 'Input mismatch' in str(e):
+                skip_counts['input_mismatch'] += 1
                 print('| WARNING: weird torch_cluster error, skipping batch')
                 for p in model.parameters():
                     if p.grad is not None:
@@ -248,6 +261,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 torch.cuda.empty_cache()
                 continue
             elif 'no cross edge found' in str(e):
+                skip_counts['no_cross_edge'] += 1
                 print('| WARNING: no cross edge found, skipping batch')
                 for p in model.parameters():
                     if p.grad is not None:
@@ -261,10 +275,24 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 torch.cuda.empty_cache()
                 continue
             else:
+                skip_counts['other_runtime'] += 1
                 print(e)
                 # raise e
                 continue
-    return meter.summary()
+    summary = meter.summary()
+    summary.update({f'batches_skipped_{k}': v for k, v in skip_counts.items()})
+    summary['loss_clamp_events'] = sum(clamp_tracker.values())
+    summary.update({f'clamp_{k}': v for k, v in clamp_tracker.items()})
+    skipped_total = sum(skip_counts.values())
+    if skipped_total > 0:
+        print(f"| WARNING: Skipped {skipped_total} batches this epoch "
+              f"(OOM: {skip_counts['oom']}, input_mismatch: {skip_counts['input_mismatch']}, "
+              f"no_cross_edge: {skip_counts['no_cross_edge']}, singleton: {skip_counts['singleton_batch']}, "
+              f"other_runtime: {skip_counts['other_runtime']})")
+    if loss_clamp_value is not None and summary['loss_clamp_events'] > 0:
+        print(f"| WARNING: Clamped loss components {summary['loss_clamp_events']} times this epoch "
+              f"(max {loss_clamp_value})")
+    return summary
 
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False):
@@ -277,13 +305,16 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             ['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_losss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss'],
             unpooled_metrics=True, intervals=10)
 
+    skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0}
+    clamp_tracker = {}
+
     for data in tqdm(loader, total=len(loader)):
         try:
             with torch.no_grad():
                 lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
 
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
-                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
+                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device, clamp_tracker=clamp_tracker)
             # print(loss)
             meter.add([loss.cpu().detach(), lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss])
 
@@ -303,6 +334,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
 
         except RuntimeError as e:
             if 'out of memory' in str(e):
+                skip_counts['oom'] += 1
                 print('| WARNING: ran out of memory, skipping batch')
                 for p in model.parameters():
                     if p.grad is not None:
@@ -310,6 +342,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 torch.cuda.empty_cache()
                 continue
             elif 'Input mismatch' in str(e):
+                skip_counts['input_mismatch'] += 1
                 print('| WARNING: weird torch_cluster error, skipping batch')
                 for p in model.parameters():
                     if p.grad is not None:
@@ -317,12 +350,24 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
                 torch.cuda.empty_cache()
                 continue
             elif 'no cross edge found' in str(e):
+                skip_counts['no_cross_edge'] += 1
                 print('| WARNING: no cross edge found - skipping batch')
                 continue
             else:
+                skip_counts['other_runtime'] += 1
                 raise e
 
     out = meter.summary()
+    out.update({f'batches_skipped_{k}': v for k, v in skip_counts.items()})
+    out['loss_clamp_events'] = sum(clamp_tracker.values())
+    out.update({f'clamp_{k}': v for k, v in clamp_tracker.items()})
+    skipped_total = sum(skip_counts.values())
+    if skipped_total > 0:
+        print(f"| WARNING: Skipped {skipped_total} batches during evaluation "
+              f"(OOM: {skip_counts['oom']}, input_mismatch: {skip_counts['input_mismatch']}, "
+              f"no_cross_edge: {skip_counts['no_cross_edge']}, other_runtime: {skip_counts['other_runtime']})")
+    if out['loss_clamp_events'] > 0:
+        print(f"| WARNING: Clamped loss components {out['loss_clamp_events']} times during evaluation")
     if test_sigma_intervals > 0: out.update(meter_all.summary())
     return out
 
