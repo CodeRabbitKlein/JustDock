@@ -362,6 +362,30 @@ def _compute_plip_consistency(data, threshold=0.5, dist_min=None, dist_max=None)
     }
 
 
+def _plip_postprocess_predictions(data, threshold=0.5, dist_min=None, dist_max=None):
+    graphs = data if isinstance(data, list) else [data]
+    adjusted = 0
+    for g in graphs:
+        preds = getattr(g, 'cross_edge_predictions', None)
+        if preds is None or 'logits' not in preds or 'geometry' not in preds:
+            continue
+        logits = preds['logits']
+        geom = preds['geometry']
+        probs = torch.softmax(logits, dim=-1)
+        max_prob, _ = probs.max(dim=-1)
+        mask = max_prob >= threshold
+        if mask.sum() == 0:
+            continue
+        if dist_min is not None:
+            geom[mask, 0] = torch.maximum(geom[mask, 0], torch.tensor(dist_min, device=geom.device))
+        if dist_max is not None:
+            geom[mask, 0] = torch.minimum(geom[mask, 0], torch.tensor(dist_max, device=geom.device))
+        preds['geometry'] = geom
+        g.cross_edge_predictions = preds
+        adjusted += int(mask.sum().item())
+    return adjusted
+
+
 def _grad_norm(model) -> Optional[float]:
     params = [p for p in model.parameters() if p.grad is not None]
     if not params:
@@ -628,7 +652,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False,
                plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
-               stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None, log_perf=False, report_dir=None, dump_metrics=False):
+               stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None, log_perf=False, report_dir=None, dump_metrics=False,
+               plip_consistency_threshold=0.5, plip_postprocess_min=None, plip_postprocess_max=None, plip_postprocess_eval=False):
     model.eval()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'],
                          unpooled_metrics=True)
@@ -650,6 +675,9 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
             start_time = time.time()
             with torch.no_grad():
                 lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
+                if plip_postprocess_eval and plip_consistency_threshold is not None:
+                    _plip_postprocess_predictions(data if isinstance(data, list) else [data], threshold=plip_consistency_threshold,
+                                                  dist_min=plip_postprocess_min, dist_max=plip_postprocess_max)
 
             stage_scale = stage_scheduler.scale if stage_scheduler is not None else 1.0
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \

@@ -88,7 +88,9 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals,
                                    plip_teacher_weight=args.plip_teacher_weight, plip_teacher_geom_weight=args.plip_teacher_geom_weight,
                                    plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing,
-                                   stage_scheduler=stage_scheduler, phys_huber_delta=args.phys_loss_huber_delta)
+                                   stage_scheduler=stage_scheduler, phys_huber_delta=args.phys_loss_huber_delta,
+                                   plip_consistency_threshold=args.plip_consistency_threshold, plip_postprocess_min=args.plip_postprocess_distance_min,
+                                   plip_postprocess_max=args.plip_postprocess_distance_max, plip_postprocess_eval=args.plip_postprocess_eval)
             print("Epoch {}: Validation loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, val_losses['loss'], val_losses['lddt_loss'], val_losses['affinity_loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'],
                             val_losses['res_tr_loss'], val_losses['res_rot_loss'], val_losses['res_chi_loss']))

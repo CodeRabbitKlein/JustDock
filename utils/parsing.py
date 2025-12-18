@@ -90,6 +90,7 @@ def parse_train_args():
     parser.add_argument('--plip_consistency_threshold', type=float, default=0.5, help='Confidence threshold for PLIP consistency metrics and optional post-processing')
     parser.add_argument('--plip_postprocess_distance_min', type=float, default=None, help='Optional min distance clamp for PLIP-driven post-processing')
     parser.add_argument('--plip_postprocess_distance_max', type=float, default=None, help='Optional max distance clamp for PLIP-driven post-processing')
+    parser.add_argument('--plip_postprocess_eval', action='store_true', default=False, help='Enable PLIP-guided post-processing during evaluation (adjust geometry for high-confidence edges)')
     # Performance/monitoring
     parser.add_argument('--log_perf_metrics', action='store_true', default=False, help='Log batch time and peak memory during train/val')
 
