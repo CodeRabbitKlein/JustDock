@@ -80,6 +80,10 @@ def parse_train_args():
     parser.add_argument('--stage_plateau_tol', type=float, default=0.002, help='Relative plateau tolerance for triggering stage switches')
     parser.add_argument('--stage_exploration_prob', type=float, default=0.05, help='Probability of exploring a non-best stage to escape local optima')
     parser.add_argument('--stage_warmup_batches', type=int, default=5, help='Batches to warm up LR after switching stages')
+    # Physically informed loss robustness
+    parser.add_argument('--phys_loss_huber_delta', type=float, default=None, help='Delta for Huber/soft-clamp on distance/angle losses (None disables)')
+    parser.add_argument('--phys_loss_label_smoothing', type=float, default=0.0, help='Label smoothing for interaction type loss (if used)')
+    parser.add_argument('--phys_loss_weight_grid', type=str, default=None, help='Comma-separated weight candidates for quick grid search, e.g. "tr=1,rot=1|tr=0.5,rot=1.5"')
 
     # Diffusion
     parser.add_argument('--lddt_weight', type=float, default=0.99, help='Weight of translation loss')

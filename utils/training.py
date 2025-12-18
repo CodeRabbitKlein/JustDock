@@ -20,7 +20,7 @@ from torch_scatter import scatter_mean
 
 def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data, t_to_sigma, device, lddt_weight=1, affinity_weight=1, tr_weight=1, rot_weight=1,
                   tor_weight=1, res_tr_weight=1, res_rot_weight=1, res_chi_weight=1, apply_mean=True, no_torsion=False, train_score=False, finetune=False, clamp_value=None, clamp_tracker=None,
-                  stage_scale=1.0):
+                  stage_scale=1.0, phys_huber_delta=None, phys_label_smoothing=0.0):
     mean_dims = (0, 1) if apply_mean else 1
 
     def track_and_clamp(value, name):
@@ -74,7 +74,11 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     # translation component
     tr_score = torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' else data.tr_score
     tr_sigma = tr_sigma.unsqueeze(-1)
-    tr_loss = track_and_clamp(((tr_pred.cpu() - tr_score) ** 2 / tr_sigma ** 2).mean(dim=mean_dims), 'tr_loss')
+    tr_diff = (tr_pred.cpu() - tr_score) / tr_sigma
+    if phys_huber_delta is not None:
+        tr_loss = track_and_clamp(torch.nn.functional.smooth_l1_loss(tr_diff, torch.zeros_like(tr_diff), beta=phys_huber_delta, reduction='mean'), 'tr_loss')
+    else:
+        tr_loss = track_and_clamp((tr_diff ** 2).mean(dim=mean_dims), 'tr_loss')
     tr_base_loss = (tr_score ** 2 / tr_sigma ** 2).mean(dim=mean_dims).detach()
 
 
@@ -84,8 +88,14 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     rot_pred_norm = rot_pred.norm(dim=-1,keepdim=True).cpu()
     rot_pred_vec = rot_pred.cpu() / (rot_pred_norm+1e-12)
 
-    rot_loss_pos = (((rot_pred.cpu() - rot_score) / rot_sigma[...,None]) ** 2).mean(dim=1)
-    rot_loss_neg = ((((rot_pred_norm-2*np.pi)*rot_pred_vec - rot_score) / rot_sigma[...,None]) ** 2).mean(dim=1)
+    rot_resid_pos = (rot_pred.cpu() - rot_score) / rot_sigma[...,None]
+    rot_resid_neg = ((rot_pred_norm-2*np.pi)*rot_pred_vec - rot_score) / rot_sigma[...,None]
+    if phys_huber_delta is not None:
+        rot_loss_pos = torch.nn.functional.smooth_l1_loss(rot_resid_pos, torch.zeros_like(rot_resid_pos), beta=phys_huber_delta, reduction='none').mean(dim=1)
+        rot_loss_neg = torch.nn.functional.smooth_l1_loss(rot_resid_neg, torch.zeros_like(rot_resid_neg), beta=phys_huber_delta, reduction='none').mean(dim=1)
+    else:
+        rot_loss_pos = (rot_resid_pos ** 2).mean(dim=1)
+        rot_loss_neg = (rot_resid_neg ** 2).mean(dim=1)
     rot_loss = torch.minimum(rot_loss_pos,rot_loss_neg)
 
     if apply_mean:
@@ -99,8 +109,14 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
             np.concatenate([d.tor_sigma_edge for d in data] if device.type == 'cuda' else data.tor_sigma_edge)).float()
         tor_score = torch.cat([d.tor_score for d in data], dim=0) if device.type == 'cuda' else data.tor_score
         # tor_loss_weight = torch.cat([d.tor_loss_weight for d in data], dim=0) if device.type == 'cuda' else data.tor_loss_weight
-        tor_loss = ((1-(tor_pred.cpu() - tor_score).cos()) / (edge_tor_sigma/np.pi))
-        tor_base_loss = ((1-(tor_score).cos()) / (edge_tor_sigma/np.pi))
+        tor_resid = 1-(tor_pred.cpu() - tor_score).cos()
+        tor_base = 1-(tor_score).cos()
+        if phys_huber_delta is not None:
+            tor_loss = torch.nn.functional.smooth_l1_loss(tor_resid, torch.zeros_like(tor_resid), beta=phys_huber_delta, reduction='none') / (edge_tor_sigma/np.pi)
+            tor_base_loss = torch.nn.functional.smooth_l1_loss(tor_base, torch.zeros_like(tor_base), beta=phys_huber_delta, reduction='none') / (edge_tor_sigma/np.pi)
+        else:
+            tor_loss = tor_resid / (edge_tor_sigma/np.pi)
+            tor_base_loss = tor_base / (edge_tor_sigma/np.pi)
         if apply_mean:
             tor_loss, tor_base_loss = track_and_clamp(tor_loss.mean(), 'tor_loss') * torch.ones(1, dtype=torch.float), track_and_clamp(tor_base_loss.mean(), 'tor_base_loss') * torch.ones(1, dtype=torch.float)
         else:
@@ -131,8 +147,15 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
 
     # local translation component
     res_tr_score = torch.cat([d.res_tr_score for d in data], dim=0) if device.type == 'cuda' else data.res_tr_score
-    res_tr_loss = torch.nn.L1Loss(reduction='none')(res_tr_pred.cpu(),res_tr_score).mean(dim=1) * res_loss_weight.squeeze(1) * 3.0#((res_tr_pred.cpu() - res_tr_score) ** 2).mean(dim=mean_dims)
-    res_tr_base_loss = (res_tr_score).abs().mean(dim=1).detach() * res_loss_weight.squeeze(1) * 3.0
+    res_tr_resid = res_tr_pred.cpu() - res_tr_score
+    if phys_huber_delta is not None:
+        res_tr_loss = torch.nn.functional.smooth_l1_loss(res_tr_resid, torch.zeros_like(res_tr_resid), beta=phys_huber_delta, reduction='none').mean(dim=1)
+        res_tr_base_loss = torch.nn.functional.smooth_l1_loss(res_tr_score, torch.zeros_like(res_tr_score), beta=phys_huber_delta, reduction='none').mean(dim=1).detach()
+    else:
+        res_tr_loss = torch.nn.L1Loss(reduction='none')(res_tr_pred.cpu(),res_tr_score).mean(dim=1)
+        res_tr_base_loss = (res_tr_score).abs().mean(dim=1).detach()
+    res_tr_loss = res_tr_loss * res_loss_weight.squeeze(1) * 3.0
+    res_tr_base_loss = res_tr_base_loss * res_loss_weight.squeeze(1) * 3.0
     if apply_mean:
         res_tr_loss = track_and_clamp(res_tr_loss.mean(), 'res_tr_loss')
         res_tr_base_loss = track_and_clamp(res_tr_base_loss.mean(), 'res_tr_base_loss')
@@ -143,9 +166,10 @@ def loss_function(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_
     # res_rot_pred_norm = res_rot_pred.norm(dim=-1,keepdim=True).cpu()
     # res_rot_pred_vec = res_rot_pred.cpu() / (res_rot_pred_norm+1e-12)
 
-    res_rot_loss_pos = (torch.nn.L1Loss(reduction='none')(res_rot_pred.cpu(),res_rot_score)).mean(dim=1)
-    # res_rot_loss_neg = (torch.nn.L1Loss(reduction='none')((res_rot_pred_norm-2*np.pi)*res_rot_pred_vec,res_rot_score)).mean(dim=1)
-    # res_rot_loss = torch.minimum(res_rot_loss_pos,res_rot_loss_neg)
+    if phys_huber_delta is not None:
+        res_rot_loss_pos = torch.nn.functional.smooth_l1_loss(res_rot_pred.cpu(), res_rot_score, beta=phys_huber_delta, reduction='none').mean(dim=1)
+    else:
+        res_rot_loss_pos = (torch.nn.L1Loss(reduction='none')(res_rot_pred.cpu(),res_rot_score)).mean(dim=1)
     res_rot_loss = res_rot_loss_pos * res_loss_weight.squeeze(1) * 15.0
     res_rot_base_loss = (res_rot_score.abs()).mean(dim=1).detach() * res_loss_weight.squeeze(1) * 15.0
     if apply_mean:
@@ -375,7 +399,7 @@ class AdaptiveStageScheduler:
 
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None, loss_clamp_value=None,
                 plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
-                stage_scheduler: AdaptiveStageScheduler = None):
+                stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None):
     model.train()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'])
     skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0, 'singleton_batch': 0}
@@ -398,7 +422,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
         try:
             lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
-                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune, clamp_tracker=clamp_tracker, stage_scale=stage_scale)
+                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune, clamp_tracker=clamp_tracker, stage_scale=stage_scale, phys_huber_delta=phys_huber_delta)
             plip_teacher_loss, plip_cls_loss, plip_geom_loss, plip_matched_edges = _compute_plip_teacher_losses(
                 data,
                 cls_weight=plip_teacher_weight,
@@ -493,7 +517,7 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
 
 def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=False,
                plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
-               stage_scheduler: AdaptiveStageScheduler = None):
+               stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None):
     model.eval()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'],
                          unpooled_metrics=True)
@@ -513,7 +537,7 @@ def test_epoch(model, loader, device, t_to_sigma, loss_fn, test_sigma_intervals=
 
             stage_scale = stage_scheduler.scale if stage_scheduler is not None else 1.0
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
-                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device, clamp_tracker=clamp_tracker, stage_scale=stage_scale)
+                loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device, clamp_tracker=clamp_tracker, stage_scale=stage_scale, phys_huber_delta=phys_huber_delta)
             plip_teacher_loss, plip_cls_loss, plip_geom_loss, plip_matched_edges = _compute_plip_teacher_losses(
                 data if isinstance(data, list) else [data],
                 cls_weight=plip_teacher_weight,
