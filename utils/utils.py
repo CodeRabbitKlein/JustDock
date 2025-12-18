@@ -150,7 +150,13 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                         use_plip_features=use_plip_features,
                         plip_num_types=plip_num_types,
                         plip_distance_embed_dim=plip_feat_dims['distance'],
-                        plip_angle_embed_dim=plip_feat_dims['angle'])
+                        plip_angle_embed_dim=plip_feat_dims['angle'],
+                        plip_distance_max=getattr(args, 'plip_distance_max', None),
+                        plip_teacher_temperature=getattr(args, 'plip_teacher_temperature', 1.0),
+                        cross_chunk_size=getattr(args, 'cross_chunk_size', None),
+                        cross_chunk_autotune=getattr(args, 'cross_chunk_autotune', False),
+                        cross_chunk_time_thresh=getattr(args, 'cross_chunk_time_thresh', None),
+                        cross_chunk_mem_thresh=getattr(args, 'cross_chunk_mem_thresh', None))
 
     if device.type == 'cuda' and not no_parallel:
         model = DataParallel(model)

@@ -96,7 +96,9 @@ class TensorProductScoreModel(torch.nn.Module):
                  scale_by_sigma=True, use_second_order_repr=False, batch_norm=True,
                  dynamic_max_cross=False, dropout=0.0, lm_embedding_type=None, confidence_mode=False,
                  confidence_dropout=0, confidence_no_batchnorm=False, num_confidence_outputs=1,finetune=False,
-                 use_plip=False, use_plip_features=False, plip_num_types=None, plip_distance_embed_dim=16, plip_angle_embed_dim=8):
+                 use_plip=False, use_plip_features=False, plip_num_types=None, plip_distance_embed_dim=16, plip_angle_embed_dim=8,
+                 plip_distance_max=None, plip_teacher_temperature=1.0,
+                 cross_chunk_size=None, cross_chunk_autotune=False, cross_chunk_time_thresh=None, cross_chunk_mem_thresh=None):
         super(TensorProductScoreModel, self).__init__()
         self.finetune = finetune
         self.t_to_sigma = t_to_sigma
@@ -123,6 +125,15 @@ class TensorProductScoreModel(torch.nn.Module):
         self.use_plip_features = use_plip_features and use_plip
         self.plip_num_types = plip_num_types if plip_num_types is not None else 0
         self.plip_feature_dim = 0
+        self.plip_distance_max = plip_distance_max
+        self.plip_teacher_temperature = plip_teacher_temperature
+        self.cross_chunk_size = cross_chunk_size
+        self.cross_chunk_autotune = cross_chunk_autotune
+        self.cross_chunk_time_thresh = cross_chunk_time_thresh
+        self.cross_chunk_mem_thresh = cross_chunk_mem_thresh
+        self._last_cross_edges = 0
+        self.plip_coverage_log_every = 20000
+        self._plip_coverage_state = {'covered': 0.0, 'total': 0}
         if self.use_plip_features and self.plip_num_types > 0:
             self.plip_distance_expansion = GaussianSmearing(0.0, cross_max_distance, plip_distance_embed_dim)
             self.plip_angle_expansion = GaussianSmearing(0.0, math.pi, plip_angle_embed_dim)
@@ -304,14 +315,40 @@ class TensorProductScoreModel(torch.nn.Module):
         else:
             cross_cutoff = self.cross_max_distance
         cross_edge_index, cross_edge_attr, cross_edge_sh = self.build_cross_conv_graph(data, cross_cutoff)
+        self._last_cross_edges = cross_edge_index.shape[1]
         cross_lig, cross_rec = cross_edge_index
-        cross_edge_attr = self.cross_edge_embedding(cross_edge_attr)
-        if self.cross_readout is not None:
-            edge_repr = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], dim=-1)
-            cross_pred = self.cross_readout(edge_repr)
-            interaction_logits = cross_pred[:, :self.plip_num_types]
-            geom_pred = cross_pred[:, self.plip_num_types:]
-            data.cross_edge_predictions = {'logits': interaction_logits, 'geometry': geom_pred, 'edge_index': cross_edge_index}
+        use_chunks = self.cross_chunk_size is not None and cross_edge_index.shape[1] > self.cross_chunk_size
+        cross_chunks = []
+        if not use_chunks:
+            cross_edge_attr = self.cross_edge_embedding(cross_edge_attr)
+            if self.cross_readout is not None:
+                edge_repr = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], dim=-1)
+                cross_pred = self.cross_readout(edge_repr)
+                interaction_logits = cross_pred[:, :self.plip_num_types]
+                geom_pred = cross_pred[:, self.plip_num_types:]
+                data.cross_edge_predictions = {'logits': interaction_logits, 'geometry': geom_pred, 'edge_index': cross_edge_index}
+        else:
+            # chunked embedding and readout
+            logits_chunks = []
+            geom_chunks = []
+            chunk_size = self.cross_chunk_size
+            for start in range(0, cross_edge_index.shape[1], chunk_size):
+                end = min(start + chunk_size, cross_edge_index.shape[1])
+                edge_chunk = cross_edge_index[:, start:end]
+                attr_chunk = self.cross_edge_embedding(cross_edge_attr[start:end])
+                sh_chunk = cross_edge_sh[start:end]
+                cross_chunks.append((edge_chunk, attr_chunk, sh_chunk))
+                if self.cross_readout is not None:
+                    lig_chunk = edge_chunk[0]
+                    rec_chunk = edge_chunk[1]
+                    edge_repr = torch.cat([attr_chunk, lig_node_attr[lig_chunk, :self.ns], rec_node_attr[rec_chunk, :self.ns]], dim=-1)
+                    cross_pred = self.cross_readout(edge_repr)
+                    logits_chunks.append(cross_pred[:, :self.plip_num_types])
+                    geom_chunks.append(cross_pred[:, self.plip_num_types:])
+            if self.cross_readout is not None and logits_chunks:
+                interaction_logits = torch.cat(logits_chunks, dim=0)
+                geom_pred = torch.cat(geom_chunks, dim=0)
+                data.cross_edge_predictions = {'logits': interaction_logits, 'geometry': geom_pred, 'edge_index': cross_edge_index}
 
         for l in range(len(self.lig_conv_layers)):
 
@@ -320,17 +357,34 @@ class TensorProductScoreModel(torch.nn.Module):
             lig_intra_update = self.lig_conv_layers[l](lig_node_attr, lig_edge_index, lig_edge_attr_, lig_edge_sh)
 
             # inter graph message passing
-            rec_to_lig_edge_attr_ = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], -1)
-            if l == 0:
-                n_vec = data['receptor'].lf_3pts[:,0] - data['receptor'].lf_3pts[:,1]
-                n_norm_vec = n_vec / (n_vec.norm(dim=-1,keepdim=True)+eps)
-                c_vec = data['receptor'].lf_3pts[:,2] - data['receptor'].lf_3pts[:,1]
-                c_norm_vec = c_vec / (c_vec.norm(dim=-1,keepdim=True)+eps)
-                lig_inter_update = self.rec_to_lig_conv_layers[l](torch.cat([rec_node_attr,n_norm_vec,c_norm_vec],dim=-1), cross_edge_index, rec_to_lig_edge_attr_, cross_edge_sh,
-                                                                  out_nodes=lig_node_attr.shape[0])
+            if not use_chunks:
+                rec_to_lig_edge_attr_ = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], -1)
+                if l == 0:
+                    n_vec = data['receptor'].lf_3pts[:,0] - data['receptor'].lf_3pts[:,1]
+                    n_norm_vec = n_vec / (n_vec.norm(dim=-1,keepdim=True)+eps)
+                    c_vec = data['receptor'].lf_3pts[:,2] - data['receptor'].lf_3pts[:,1]
+                    c_norm_vec = c_vec / (c_vec.norm(dim=-1,keepdim=True)+eps)
+                    lig_inter_update = self.rec_to_lig_conv_layers[l](torch.cat([rec_node_attr,n_norm_vec,c_norm_vec],dim=-1), cross_edge_index, rec_to_lig_edge_attr_, cross_edge_sh,
+                                                                      out_nodes=lig_node_attr.shape[0])
+                else:
+                    lig_inter_update = self.rec_to_lig_conv_layers[l](rec_node_attr, cross_edge_index, rec_to_lig_edge_attr_, cross_edge_sh,
+                                                                      out_nodes=lig_node_attr.shape[0])
             else:
-                lig_inter_update = self.rec_to_lig_conv_layers[l](rec_node_attr, cross_edge_index, rec_to_lig_edge_attr_, cross_edge_sh,
-                                                                  out_nodes=lig_node_attr.shape[0])
+                lig_inter_update = torch.zeros_like(lig_node_attr)
+                if l == 0:
+                    n_vec = data['receptor'].lf_3pts[:,0] - data['receptor'].lf_3pts[:,1]
+                    n_norm_vec = n_vec / (n_vec.norm(dim=-1,keepdim=True)+eps)
+                    c_vec = data['receptor'].lf_3pts[:,2] - data['receptor'].lf_3pts[:,1]
+                    c_norm_vec = c_vec / (c_vec.norm(dim=-1,keepdim=True)+eps)
+                    rec_base = torch.cat([rec_node_attr,n_norm_vec,c_norm_vec],dim=-1)
+                for edge_chunk, attr_chunk, sh_chunk in cross_chunks:
+                    rec_to_lig_edge_attr_ = torch.cat([attr_chunk, lig_node_attr[edge_chunk[0], :self.ns], rec_node_attr[edge_chunk[1], :self.ns]], -1)
+                    if l == 0:
+                        lig_inter_update = lig_inter_update + self.rec_to_lig_conv_layers[l](rec_base, edge_chunk, rec_to_lig_edge_attr_, sh_chunk,
+                                                                                              out_nodes=lig_node_attr.shape[0])
+                    else:
+                        lig_inter_update = lig_inter_update + self.rec_to_lig_conv_layers[l](rec_node_attr, edge_chunk, rec_to_lig_edge_attr_, sh_chunk,
+                                                                                              out_nodes=lig_node_attr.shape[0])
 
             # if l != len(self.lig_conv_layers) - 1:
             rec_edge_attr_ = torch.cat([rec_edge_attr, rec_node_attr[rec_src, :self.ns], rec_node_attr[rec_dst, :self.ns]], -1)
@@ -338,10 +392,17 @@ class TensorProductScoreModel(torch.nn.Module):
                 rec_intra_update = self.rec_conv_layers[l](torch.cat([rec_node_attr,n_norm_vec,c_norm_vec],dim=-1), rec_edge_index, rec_edge_attr_, rec_edge_sh)
             else:
                 rec_intra_update = self.rec_conv_layers[l](rec_node_attr, rec_edge_index, rec_edge_attr_, rec_edge_sh)
-            # print(torch.isnan(rec_intra_update).sum())
-            lig_to_rec_edge_attr_ = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], -1)
-            rec_inter_update = self.lig_to_rec_conv_layers[l](lig_node_attr, torch.flip(cross_edge_index, dims=[0]), lig_to_rec_edge_attr_,
-                                                              cross_edge_sh, out_nodes=rec_node_attr.shape[0])
+            if not use_chunks:
+                lig_to_rec_edge_attr_ = torch.cat([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], -1)
+                rec_inter_update = self.lig_to_rec_conv_layers[l](lig_node_attr, torch.flip(cross_edge_index, dims=[0]), lig_to_rec_edge_attr_,
+                                                                  cross_edge_sh, out_nodes=rec_node_attr.shape[0])
+            else:
+                rec_inter_update = torch.zeros_like(rec_node_attr)
+                for edge_chunk, attr_chunk, sh_chunk in cross_chunks:
+                    flipped = torch.flip(edge_chunk, dims=[0])
+                    lig_to_rec_edge_attr_ = torch.cat([attr_chunk, lig_node_attr[flipped[0], :self.ns], rec_node_attr[flipped[1], :self.ns]], -1)
+                    rec_inter_update = rec_inter_update + self.lig_to_rec_conv_layers[l](lig_node_attr, flipped, lig_to_rec_edge_attr_,
+                                                                                        sh_chunk, out_nodes=rec_node_attr.shape[0])
             # padding original features
             lig_node_attr = F.pad(lig_node_attr, (0, lig_intra_update.shape[-1] - lig_node_attr.shape[-1]))
 
@@ -554,6 +615,24 @@ class TensorProductScoreModel(torch.nn.Module):
 
         return bonds, edge_index, edge_attr, edge_sh
 
+    def maybe_autotune_chunk(self, elapsed, mem_mb=None):
+        if not self.cross_chunk_autotune:
+            return
+        time_hit = self.cross_chunk_time_thresh is not None and elapsed is not None and elapsed > self.cross_chunk_time_thresh
+        mem_hit = self.cross_chunk_mem_thresh is not None and mem_mb is not None and mem_mb > self.cross_chunk_mem_thresh
+        if not (time_hit or mem_hit):
+            # relax chunking if far below threshold
+            if self.cross_chunk_size is not None and self.cross_chunk_time_thresh is not None and elapsed is not None and elapsed < 0.7 * self.cross_chunk_time_thresh:
+                self.cross_chunk_size = int(self.cross_chunk_size * 1.1)
+            return
+        # tighten chunk size
+        if self.cross_chunk_size is None:
+            base_edges = max(self._last_cross_edges, 50000)
+            self.cross_chunk_size = max(int(base_edges / 2), 1000)
+        else:
+            self.cross_chunk_size = max(int(self.cross_chunk_size * 0.8), 1000)
+        print(f"Auto chunking enabled: chunk_size={self.cross_chunk_size}, last_edges={self._last_cross_edges}, time_hit={time_hit}, mem_hit={mem_hit}")
+
     def _encode_plip_features(self, data, lig_indices, rec_indices):
         if not self.use_plip_features or self.plip_feature_dim == 0:
             return None
@@ -570,9 +649,17 @@ class TensorProductScoreModel(torch.nn.Module):
                 continue
             inter_idx = pair_to_idx[key]
             dist_val = interactions['distance'][inter_idx].to(device)
+            if self.plip_distance_max is not None:
+                dist_val = torch.clamp(dist_val, max=self.plip_distance_max)
             angle_val = interactions['angle'][inter_idx].to(device)
+            angle_val = torch.clamp(angle_val, min=0.0, max=math.pi)
             type_val = interactions['type'][inter_idx].to(device)
             direction_val = interactions['direction'][inter_idx].to(device)
+            if direction_val.dim() == 1 and direction_val.numel() == 3:
+                norm = torch.linalg.norm(direction_val)
+                if norm > 0:
+                    direction_val = direction_val / torch.clamp(norm, min=1.0)
+                direction_val = direction_val.clamp(min=-1.0, max=1.0)
             conf_val = interactions['confidence'][inter_idx].to(device)
             dist_emb = self.plip_distance_expansion(dist_val)
             angle_emb = self.plip_angle_expansion(angle_val)
@@ -592,7 +679,23 @@ class TensorProductScoreModel(torch.nn.Module):
                 ],
                 dim=0,
             )
+        mask = features[:, -1]
+        if mask.numel() > 0:
+            data.plip_edge_coverage = mask.mean().item()
+            self._record_plip_coverage(mask)
         return features
+
+    def _record_plip_coverage(self, mask_tensor):
+        total = int(mask_tensor.numel())
+        covered = float(mask_tensor.sum().item())
+        state = self._plip_coverage_state
+        state['covered'] += covered
+        state['total'] += total
+        if state['total'] >= self.plip_coverage_log_every and state['total'] > 0:
+            ratio = state['covered'] / state['total'] if state['total'] else 0.0
+            print(f'PLIP coverage running average: {ratio:.3f} ({int(state["covered"])} / {int(state["total"])} edges)')
+            state['covered'] = 0.0
+            state['total'] = 0
 
 
 class GaussianSmearing(torch.nn.Module):
