@@ -15,6 +15,7 @@ from torch_geometric.nn.data_parallel import DataParallel
 
 from models.all_atom_score_model import TensorProductScoreModel as AAScoreModel
 from models.score_model import TensorProductScoreModel as CGScoreModel
+from datasets.plip_extract import DEFAULT_INTERACTION_TYPES
 from utils.diffusion_utils import get_timestep_embedding
 from spyrmsd import rmsd, molecule
 
@@ -98,6 +99,8 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
 
     lm_embedding_type = None
     if args.esm_embeddings_path is not None: lm_embedding_type = 'esm'
+    plip_types = args.plip_interaction_types.split(',') if args.plip_interaction_types else list(DEFAULT_INTERACTION_TYPES)
+    plip_num_types = len(plip_types) if args.use_plip else 0
 
     model = model_class(t_to_sigma=t_to_sigma,
                         device=device,
@@ -119,7 +122,9 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                         confidence_mode=confidence_mode,
                         num_confidence_outputs=len(
                             args.rmsd_classification_cutoff) + 1 if 'rmsd_classification_cutoff' in args and isinstance(
-                            args.rmsd_classification_cutoff, list) else 1)
+                            args.rmsd_classification_cutoff, list) else 1,
+                        use_plip=args.use_plip,
+                        plip_num_types=plip_num_types)
 
     if device.type == 'cuda' and not no_parallel:
         model = DataParallel(model)

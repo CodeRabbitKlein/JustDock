@@ -21,7 +21,9 @@ from torch_geometric.transforms import BaseTransform
 from tqdm import tqdm
 
 from datasets.process_mols import read_molecule, get_rec_graph, generate_conformer, \
-    get_lig_graph_with_matching, extract_receptor_structure, parse_receptor, parse_pdb_from_path
+    get_lig_graph_with_matching, extract_receptor_structure, parse_receptor, parse_pdb_from_path, \
+    lig_feature_dims, rec_residue_feature_dims
+from datasets.plip_extract import DEFAULT_INTERACTION_TYPES, load_plip_cache
 from utils.diffusion_utils import modify_conformer, set_time
 from utils.utils import read_strings_from_txt
 from utils import so3, torus
@@ -98,7 +100,8 @@ class PDBBind(Dataset):
                  receptor_radius=30, num_workers=1, c_alpha_max_neighbors=None, popsize=15, maxiter=15,
                  matching=True, keep_original=False, max_lig_size=None, remove_hs=False, num_conformers=1, center_ligand=False, all_atoms=False,
                  atom_radius=5, atom_max_neighbors=None, esm_embeddings_path=None, require_ligand=False, require_receptor=False,
-                 ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=False, use_existing_cache=True):
+                 ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=False, use_existing_cache=True,
+                 use_plip=False, plip_cache_dir='data/cache_plip', plip_confidence_threshold=0.5, plip_interaction_types=None):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
@@ -118,6 +121,10 @@ class PDBBind(Dataset):
         self.name_list = name_list
         self.ligand_descriptions = ligand_descriptions
         self.keep_local_structures = keep_local_structures
+        self.use_plip = use_plip
+        self.plip_cache_dir = plip_cache_dir
+        self.plip_confidence_threshold = plip_confidence_threshold
+        self.plip_interaction_types = plip_interaction_types if plip_interaction_types is not None else list(DEFAULT_INTERACTION_TYPES)
         if matching or protein_path_list is not None and ligand_descriptions is not None:
             cache_path += '_torsion'
         if all_atoms:
@@ -148,6 +155,10 @@ class PDBBind(Dataset):
         print('loading data from memory: ', os.path.join(self.full_cache_path, "heterographs.pkl"))
         with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'rb') as f:
             self.complex_graphs = pickle.load(f)
+        for g in self.complex_graphs:
+            self._ensure_anchor_fields(g)
+            if self.use_plip and hasattr(g, 'name'):
+                self._apply_plip_interactions(g, g.name)
         if require_ligand:
             with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
                 self.rdkit_ligands = pickle.load(f)
@@ -174,6 +185,85 @@ class PDBBind(Dataset):
             complex_graph.rec_pdb = copy.deepcopy(self.receptor_pdbs[idx])
         # complex_graph['receptor'].acc_pred_chis = complex_graph['receptor'].acc_pred_chis[:,:5]
         return complex_graph
+
+    def _apply_plip_interactions(self, complex_graph, name):
+        if not self.use_plip:
+            return
+        cache = load_plip_cache(name, self.plip_cache_dir)
+        if cache is None or cache.get('interactions') is None:
+            print(f'PLIP cache missing for {name}, skipping PLIP features.')
+            return
+        lig_idxs, rec_idxs, types, distances, angles, directions, confidences = [], [], [], [], [], [], []
+        for entry in cache.get('interactions', []):
+            try:
+                lig_idx = int(entry.get('lig_atom_idx'))
+                rec_idx = int(entry.get('rec_residue_idx'))
+            except Exception:
+                continue
+            if lig_idx >= complex_graph['ligand'].num_nodes or rec_idx >= complex_graph['receptor'].num_nodes:
+                continue
+            interaction_type = entry.get('interaction_type', 'misc')
+            if interaction_type not in self.plip_interaction_types:
+                continue
+            lig_idxs.append(lig_idx)
+            rec_idxs.append(rec_idx)
+            types.append(self.plip_interaction_types.index(interaction_type))
+            distances.append(float(entry.get('distance', 0.0)))
+            angles.append(float(entry.get('angle', 0.0)) if entry.get('angle') is not None else 0.0)
+            direction = entry.get('direction', [0.0, 0.0, 0.0])
+            if direction is None:
+                direction = [0.0, 0.0, 0.0]
+            directions.append(direction)
+            confidences.append(float(entry.get('confidence', 1.0)))
+        if len(lig_idxs) == 0:
+            return
+        edge_index = torch.tensor([lig_idxs, rec_idxs], dtype=torch.long)
+        complex_graph.plip_edge_index = edge_index
+        complex_graph.plip_type = torch.tensor(types, dtype=torch.long)
+        complex_graph.plip_distance = torch.tensor(distances, dtype=torch.float32)
+        complex_graph.plip_angle = torch.tensor(angles, dtype=torch.float32)
+        complex_graph.plip_direction = torch.tensor(directions, dtype=torch.float32)
+        complex_graph.plip_confidence = torch.tensor(confidences, dtype=torch.float32)
+        complex_graph.plip_interactions = {
+            'edge_index': edge_index,
+            'type': complex_graph.plip_type,
+            'distance': complex_graph.plip_distance,
+            'angle': complex_graph.plip_angle,
+            'direction': complex_graph.plip_direction,
+            'confidence': complex_graph.plip_confidence,
+        }
+        # anchor masks
+        lig_anchor = complex_graph['ligand'].anchor_mask.clone()
+        rec_anchor = complex_graph['receptor'].anchor_mask.clone()
+        confidence_tensor = complex_graph.plip_interactions['confidence']
+        high_conf = confidence_tensor >= self.plip_confidence_threshold
+        for lig_idx, rec_idx, mask in zip(lig_idxs, rec_idxs, high_conf):
+            if mask:
+                lig_anchor[lig_idx] = 1.0
+                rec_anchor[rec_idx] = 1.0
+        complex_graph['ligand'].anchor_mask = lig_anchor
+        complex_graph['ligand'].x[:, -1] = lig_anchor
+        complex_graph['receptor'].anchor_mask = rec_anchor
+        complex_graph['receptor'].x[:, 1] = rec_anchor
+        complex_graph.plip_pair_to_index = {(int(l), int(r)): idx for idx, (l, r) in enumerate(zip(lig_idxs, rec_idxs))}
+
+    def _ensure_anchor_fields(self, complex_graph):
+        # ligand anchors
+        if 'anchor_mask' not in complex_graph['ligand']:
+            lig_anchor = torch.zeros(complex_graph['ligand'].num_nodes, dtype=torch.float32)
+            complex_graph['ligand'].anchor_mask = lig_anchor
+            if complex_graph['ligand'].x.shape[1] == len(lig_feature_dims[0]):
+                complex_graph['ligand'].x = torch.cat([complex_graph['ligand'].x.float(), lig_anchor.unsqueeze(-1)], dim=1)
+        elif complex_graph['ligand'].x.shape[1] == len(lig_feature_dims[0]):
+            complex_graph['ligand'].x = torch.cat([complex_graph['ligand'].x.float(), complex_graph['ligand'].anchor_mask.unsqueeze(-1)], dim=1)
+        # receptor anchors
+        if 'anchor_mask' not in complex_graph['receptor']:
+            rec_anchor = torch.zeros(complex_graph['receptor'].num_nodes, dtype=torch.float32)
+            complex_graph['receptor'].anchor_mask = rec_anchor
+        else:
+            rec_anchor = complex_graph['receptor'].anchor_mask
+        if complex_graph['receptor'].x.shape[1] in (1, 1281):
+            complex_graph['receptor'].x = torch.cat([complex_graph['receptor'].x.float(), rec_anchor.unsqueeze(-1)], dim=1)
 
     def process_one_batch(self,param):
         complex_names,lm_embeddings_chains,i = param
@@ -415,6 +505,8 @@ class PDBBind(Dataset):
                               c_alpha_max_neighbors=self.c_alpha_max_neighbors, all_atoms=self.all_atoms,
                               atom_radius=self.atom_radius, atom_max_neighbors=self.atom_max_neighbors, remove_hs=self.remove_hs, lm_embeddings=lm_embeddings)
 
+                self._apply_plip_interactions(complex_graph, name)
+
             except Exception as e:
                 print(f'Skipping {name} because of the error:')
                 print(e)
@@ -453,7 +545,8 @@ class PDBBindScoring(Dataset):
                  receptor_radius=30, num_workers=1, c_alpha_max_neighbors=None, popsize=15, maxiter=15,
                  matching=True, keep_original=False, max_lig_size=None, remove_hs=False, num_conformers=1, center_ligand=False, all_atoms=False,
                  atom_radius=5, atom_max_neighbors=None, esm_embeddings_path=None, require_ligand=False, require_receptor=False,
-                 ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=False, use_existing_cache=True):
+                 ligands_list=None, protein_path_list=None, ligand_descriptions=None, name_list=None, keep_local_structures=False, use_existing_cache=True,
+                 use_plip=False, plip_cache_dir='data/cache_plip', plip_confidence_threshold=0.5, plip_interaction_types=None):
 
         super().__init__(root, transform)
         self.pdbbind_dir = root
@@ -472,6 +565,10 @@ class PDBBindScoring(Dataset):
         self.name_list = name_list
         self.ligand_descriptions = ligand_descriptions
         self.keep_local_structures = keep_local_structures
+        self.use_plip = use_plip
+        self.plip_cache_dir = plip_cache_dir
+        self.plip_confidence_threshold = plip_confidence_threshold
+        self.plip_interaction_types = plip_interaction_types if plip_interaction_types is not None else list(DEFAULT_INTERACTION_TYPES)
         if matching or protein_path_list is not None and ligand_descriptions is not None:
             cache_path += '_torsion'
         if all_atoms:
@@ -792,7 +889,11 @@ def construct_loader(args, t_to_sigma):
                    'matching': not args.no_torsion, 'popsize': args.matching_popsize, 'maxiter': args.matching_maxiter,
                    'num_workers': args.num_workers, 'all_atoms': args.all_atoms,
                    'atom_radius': args.atom_radius, 'atom_max_neighbors': args.atom_max_neighbors,
-                   'esm_embeddings_path': args.esm_embeddings_path}
+                   'esm_embeddings_path': args.esm_embeddings_path,
+                   'use_plip': args.use_plip,
+                   'plip_cache_dir': args.plip_cache_dir,
+                   'plip_confidence_threshold': args.plip_confidence_threshold,
+                   'plip_interaction_types': args.plip_interaction_types.split(',') if args.plip_interaction_types else None}
     info=pd.read_csv(args.info_path,dtype={'gap_mask':str})
     train_dataset = PDBBind(info=info,cache_path=args.cache_path, split_path=args.split_train, keep_original=True,
                             num_conformers=args.num_conformers, **common_args)

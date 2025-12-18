@@ -83,7 +83,7 @@ lig_feature_dims = (list(map(len, [
     allowable_features['possible_is_in_ring6_list'],
     allowable_features['possible_is_in_ring7_list'],
     allowable_features['possible_is_in_ring8_list'],
-])), 0)  # number of scalar features
+])), 1)  # number of scalar features (anchor mask)
 
 rec_atom_feature_dims = (list(map(len, [
     allowable_features['possible_amino_acids'],
@@ -94,7 +94,7 @@ rec_atom_feature_dims = (list(map(len, [
 
 rec_residue_feature_dims = (list(map(len, [
     allowable_features['possible_amino_acids']
-])), 14)
+])), 15)
 
 
 def lig_atom_featurizer(mol):
@@ -285,6 +285,7 @@ def extract_receptor_structure(rec, lig=None, lm_embedding_chains=None):
 def get_lig_graph(mol, complex_graph):
     lig_coords = torch.from_numpy(mol.GetConformer().GetPositions()).float()
     atom_feats = lig_atom_featurizer(mol)
+    anchor_mask = torch.zeros((atom_feats.shape[0], 1), dtype=torch.float32)
 
     row, col, edge_type = [], [], []
     for bond in mol.GetBonds():
@@ -297,7 +298,8 @@ def get_lig_graph(mol, complex_graph):
     edge_type = torch.tensor(edge_type, dtype=torch.long)
     edge_attr = F.one_hot(edge_type, num_classes=len(bonds)).to(torch.float)
 
-    complex_graph['ligand'].x = atom_feats
+    complex_graph['ligand'].anchor_mask = anchor_mask.squeeze(-1)
+    complex_graph['ligand'].x = torch.cat([atom_feats.float(), anchor_mask], dim=1)
     complex_graph['ligand'].pos = lig_coords
     complex_graph['ligand', 'lig_bond', 'ligand'].edge_index = edge_index
     complex_graph['ligand', 'lig_bond', 'ligand'].edge_attr = edge_attr
@@ -433,11 +435,15 @@ def get_calpha_graph(name,rec, af2_rec, c_alpha_coords, n_coords, c_coords, chis
     assert len(src_list) == len(dst_list)
 
     node_feat = rec_residue_featurizer(rec)
+    anchor_mask = torch.zeros((node_feat.shape[0], 1), dtype=torch.float32)
+    anchor_mask = torch.zeros((node_feat.shape[0], 1), dtype=torch.float32)
     mu_r_norm = torch.from_numpy(np.array(mean_norm_list).astype(np.float32))
     side_chain_vecs = torch.from_numpy(
         np.concatenate([np.expand_dims(n_rel_pos, axis=1), np.expand_dims(c_rel_pos, axis=1)], axis=1))
 
-    complex_graph['receptor'].x = torch.cat([node_feat, torch.tensor(lm_embeddings)], axis=1) if lm_embeddings is not None else node_feat
+    base_x = torch.cat([node_feat, anchor_mask], axis=1)
+    complex_graph['receptor'].anchor_mask = anchor_mask.squeeze(-1)
+    complex_graph['receptor'].x = torch.cat([base_x, torch.tensor(lm_embeddings)], axis=1) if lm_embeddings is not None else base_x
     complex_graph['receptor'].pos = torch.from_numpy(c_alpha_coords).float()
     complex_graph['receptor'].lf_3pts = torch.from_numpy(np.array(lf_3pts)).float()
     # complex_graph['receptor'].local_frames = get_local_frames(torch.from_numpy(np.array(lf_3pts)).float())
@@ -551,7 +557,9 @@ def get_fullrec_graph(name, rec, rec_coords, c_alpha_coords, n_coords, c_coords,
     side_chain_vecs = torch.from_numpy(
         np.concatenate([np.expand_dims(n_rel_pos, axis=1), np.expand_dims(c_rel_pos, axis=1)], axis=1))
 
-    complex_graph['receptor'].x = torch.cat([node_feat, torch.tensor(lm_embeddings)], axis=1) if lm_embeddings is not None else node_feat
+    base_x = torch.cat([node_feat, anchor_mask], axis=1)
+    complex_graph['receptor'].anchor_mask = anchor_mask.squeeze(-1)
+    complex_graph['receptor'].x = torch.cat([base_x, torch.tensor(lm_embeddings)], axis=1) if lm_embeddings is not None else base_x
     complex_graph['receptor'].pos = torch.from_numpy(c_alpha_coords).float()
     complex_graph['receptor'].lf_3pts = torch.from_numpy(np.array(lf_3pts)).float()
     complex_graph['receptor'].mu_r_norm = mu_r_norm
