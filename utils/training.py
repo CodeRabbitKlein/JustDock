@@ -394,6 +394,34 @@ def _grad_norm(model) -> Optional[float]:
     return float(norm.item())
 
 
+def _maybe_dropout_anchors(batch, dropout_rate: float, apply_prob: float):
+    """
+    Randomly zero out anchor masks to encourage robustness to missing PLIP anchors.
+    """
+    if dropout_rate <= 0 or apply_prob <= 0:
+        return
+    dropout_rate = min(max(dropout_rate, 0.0), 1.0)
+    apply_prob = min(max(apply_prob, 0.0), 1.0)
+    graphs = batch if isinstance(batch, list) else [batch]
+    for g in graphs:
+        if random.random() > apply_prob:
+            continue
+        for key, feature_idx in [('ligand', -1), ('receptor', 1)]:
+            node_data = g[key]
+            anchor = getattr(node_data, 'anchor_mask', None)
+            if anchor is None:
+                continue
+            keep = torch.bernoulli(torch.full_like(anchor, 1 - dropout_rate))
+            new_anchor = anchor * keep
+            node_data.anchor_mask = new_anchor
+            if hasattr(node_data, 'x') and node_data.x.ndim == 2 and node_data.x.shape[0] == new_anchor.shape[0]:
+                # Ligand anchor appended as last column; receptor anchor stored at index 1 when present.
+                if feature_idx == -1:
+                    node_data.x[:, -1] = new_anchor
+                elif node_data.x.shape[1] > feature_idx:
+                    node_data.x[:, feature_idx] = new_anchor
+
+
 class AdaptiveStageScheduler:
     def __init__(self, stage_scales, min_batches=200, cooldown_batches=50, plateau_tol=0.002, exploration_prob=0.05, warmup_batches=5, ema_alpha=0.1):
         self.stage_scales = stage_scales
@@ -509,7 +537,8 @@ class AdaptiveStageScheduler:
 def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, train_score=False, finetune=False, grad_clip=None, loss_clamp_value=None,
                 plip_teacher_weight=0.0, plip_teacher_geom_weight=0.0, plip_teacher_temperature=1.0, plip_teacher_label_smoothing=0.0,
                 stage_scheduler: AdaptiveStageScheduler = None, phys_huber_delta=None, log_perf=False,
-                plip_consistency_threshold=0.5, plip_postprocess_min=None, plip_postprocess_max=None):
+                plip_consistency_threshold=0.5, plip_postprocess_min=None, plip_postprocess_max=None,
+                plip_anchor_dropout_rate: float = 0.0, plip_anchor_dropout_apply_prob: float = 0.5):
     model.train()
     meter = AverageMeter(['loss', 'lddt_loss', 'affinity_loss', 'tr_loss', 'rot_loss', 'tor_loss', 'res_tr_loss', 'res_rot_loss', 'res_chi_loss', 'base_loss', 'lddt_base_loss', 'affinity_base_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'res_tr_base_loss', 'res_rot_base_loss', 'res_chi_base_loss', 'plip_teacher_loss', 'plip_cls_loss', 'plip_geom_loss', 'plip_matched_edges'])
     skip_counts = {'oom': 0, 'input_mismatch': 0, 'no_cross_edge': 0, 'other_runtime': 0, 'singleton_batch': 0}
@@ -533,6 +562,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             group.setdefault('base_lr', group.get('base_lr', group['lr']))
             group['lr'] = group['base_lr'] * lr_scale
         try:
+            if plip_anchor_dropout_rate > 0:
+                _maybe_dropout_anchors(data, plip_anchor_dropout_rate, plip_anchor_dropout_apply_prob)
             lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred = model(data)
             loss, lddt_loss, affinity_loss, tr_loss, rot_loss, tor_loss, res_tr_loss, res_rot_loss, res_chi_loss, base_loss, lddt_base_loss, affinity_base_loss, tr_base_loss, rot_base_loss, tor_base_loss, res_tr_base_loss, res_rot_base_loss, res_chi_base_loss = \
                 loss_fn(lddt_pred, affinity_pred, tr_pred, rot_pred, tor_pred, res_tr_pred, res_rot_pred, res_chi_pred, data=data, t_to_sigma=t_to_sigma, device=device, train_score=train_score, finetune=finetune, clamp_tracker=clamp_tracker, stage_scale=stage_scale, phys_huber_delta=phys_huber_delta)
