@@ -54,7 +54,9 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, grad_clip=args.grad_clip_norm, loss_clamp_value=args.loss_clamp,
                                        plip_teacher_weight=args.plip_teacher_weight, plip_teacher_geom_weight=args.plip_teacher_geom_weight,
                                        plip_teacher_temperature=args.plip_teacher_temperature, plip_teacher_label_smoothing=args.plip_teacher_label_smoothing,
-                                       stage_scheduler=stage_scheduler, phys_huber_delta=args.phys_loss_huber_delta)
+                                       stage_scheduler=stage_scheduler, phys_huber_delta=args.phys_loss_huber_delta,
+                                       plip_anchor_dropout_rate=args.plip_anchor_dropout_rate,
+                                       plip_anchor_dropout_apply_prob=args.plip_anchor_dropout_apply_prob)
             print("Epoch {}: Training loss {:.4f}  lddt {:.4f}  affinity {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}  res_tr {:.4f}   res_rot {:.4f}   res_chi {:.4f}"
                   .format(epoch, train_losses['loss'], train_losses['lddt_loss'], train_losses['affinity_loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                           train_losses['tor_loss'], train_losses['res_tr_loss'], train_losses['res_rot_loss'], train_losses['res_chi_loss']))

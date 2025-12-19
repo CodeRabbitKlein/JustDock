@@ -73,6 +73,8 @@ def parse_train_args():
     parser.add_argument('--plip_teacher_geom_weight', type=float, default=0.0, help='Weight for PLIP geometry supervision (distance/angle)')
     parser.add_argument('--plip_teacher_temperature', type=float, default=1.0, help='Temperature for PLIP teacher logits')
     parser.add_argument('--plip_teacher_label_smoothing', type=float, default=0.0, help='Label smoothing for PLIP interaction classification supervision')
+    parser.add_argument('--plip_anchor_dropout_rate', type=float, default=0.0, help='Per-node dropout rate for PLIP anchor masks during training (0 disables)')
+    parser.add_argument('--plip_anchor_dropout_apply_prob', type=float, default=0.5, help='Probability of applying anchor dropout to a graph when enabled')
     # Adaptive stage/three-phase noise scheduling
     parser.add_argument('--stage_scales', type=str, default='1.0,0.8,0.6', help='Comma-separated noise scaling factors per stage (three-phase scheduling)')
     parser.add_argument('--stage_min_batches', type=int, default=200, help='Minimum batches to stay in a stage before considering a switch')
