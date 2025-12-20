@@ -74,10 +74,34 @@ class NoiseTransform(BaseTransform):
         torsion_updates = np.random.normal(loc=0.0, scale=tor_sigma, size=data['ligand'].edge_mask.sum()) if torsion_updates is None else torsion_updates
         torsion_updates = None if self.no_torsion else torsion_updates
 
-        res_sigma = torch.clamp(res_tr_sigma + torch.normal(mean=0., std=0.2, size=(1,)).float(),min=0., max=1.)[0]
-        res_tr_update = data['receptor'].af2_trans * res_sigma #+ torch.normal(mean=0, std=0.5, size=(data['receptor'].pos.shape[0], 3))#torch.normal(mean=0, std=res_tr_sigma, size=(data['receptor'].pos.shape[0], 1)).abs() if res_tr_update is None else res_tr_update
-        res_rot_update = data['receptor'].af2_rotvecs * res_sigma #torch.normal(mean=0, std=res_rot_sigma, size=(data['receptor'].pos.shape[0], 1)).abs() if res_rot_update is None else res_rot_update
-        res_chi_update = (data['receptor'].af2_chis[:,[0,2,4,5,6]] * res_sigma + torch.normal(mean=0, std=0.3, size=(data['receptor'].pos.shape[0], 5))) * data['receptor'].chi_masks[:,[0,2,4,5,6]] if res_chi_update is None else res_chi_update
+        has_af2 = hasattr(data['receptor'], 'af2_trans') and data['receptor'].af2_trans is not None
+
+        if has_af2:
+            res_sigma = torch.clamp(res_tr_sigma + torch.normal(mean=0., std=0.2, size=(1,)).float(), min=0., max=1.)[0]
+            res_tr_update = data['receptor'].af2_trans * res_sigma #+ torch.normal(mean=0, std=0.5, size=(data['receptor'].pos.shape[0], 3))#torch.normal(mean=0, std=res_tr_sigma, size=(data['receptor'].pos.shape[0], 1)).abs() if res_tr_update is None else res_tr_update
+            res_rot_update = data['receptor'].af2_rotvecs * res_sigma #torch.normal(mean=0, std=res_rot_sigma, size=(data['receptor'].pos.shape[0], 1)).abs() if res_rot_update is None else res_rot_update
+            res_chi_update = (data['receptor'].af2_chis[:,[0,2,4,5,6]] * res_sigma + torch.normal(mean=0, std=0.3, size=(data['receptor'].pos.shape[0], 5))) * data['receptor'].chi_masks[:,[0,2,4,5,6]] if res_chi_update is None else res_chi_update
+        else:
+            decay_weight = torch.pow(data.res_decay_weight, 0.5)
+            eps = 1e-6
+            device = data['receptor'].pos.device
+            res_tr_sigma_t = torch.as_tensor(res_tr_sigma, device=device, dtype=torch.float32)
+            res_rot_sigma_t = torch.as_tensor(res_rot_sigma, device=device, dtype=torch.float32)
+            res_chi_sigma_t = torch.as_tensor(res_chi_sigma, device=device, dtype=torch.float32)
+
+            sigma_tr = torch.clamp(res_tr_sigma_t, min=0.) * decay_weight
+            sigma_rot = torch.clamp(res_rot_sigma_t, min=0.) * decay_weight
+            sigma_chi = torch.clamp(res_chi_sigma_t, min=0.) * decay_weight
+
+            res_tr_update = torch.normal(mean=0., std=sigma_tr.expand(-1, 3)) if res_tr_update is None else res_tr_update
+
+            rand_dir = torch.randn(data['receptor'].pos.shape[0], 3, device=device)
+            rand_dir = rand_dir / (rand_dir.norm(dim=-1, keepdim=True) + eps)
+            rot_amp = torch.normal(mean=0., std=sigma_rot.squeeze(-1).clamp(min=eps))
+            res_rot_update = rand_dir * rot_amp.unsqueeze(-1) if res_rot_update is None else res_rot_update
+
+            chi_mask = data['receptor'].chi_masks[:, [0,2,4,5,6]]
+            res_chi_update = torch.normal(mean=0., std=sigma_chi.expand(-1, 5)) * chi_mask if res_chi_update is None else res_chi_update
         modify_conformer(data, tr_update, rot_update, torsion_updates, res_tr_update, res_rot_update, res_chi_update)
         data.tr_score = -tr_update
         data.rot_score = -rot_update#torch.from_numpy(so3.score_vec(vec=rot_update, eps=rot_sigma)).float().unsqueeze(0)
@@ -667,7 +691,6 @@ class PDBBind(Dataset):
                     continue
                 protein_paths_chunk = self.protein_path_list[self.parallel_count*i:self.parallel_count*(i+1)]
                 ligand_description_chunk = self.ligand_descriptions[self.parallel_count*i:self.parallel_count*(i+1)]
-                ligands_chunk = ligands_list[self.parallel_count * i:self.parallel_count * (i + 1)]
                 lm_embeddings_chains = lm_embeddings_chains_all[self.parallel_count*i:self.parallel_count*(i+1)]
                 complex_graphs, rdkit_ligands = [], []
                 if self.num_workers > 1:
@@ -675,7 +698,7 @@ class PDBBind(Dataset):
                     p.__enter__()
                 with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i}/{len(protein_paths_chunk)//self.parallel_count+1}') as pbar:
                     map_fn = p.imap_unordered if self.num_workers > 1 else map
-                    for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk)):
+                    for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligand_description_chunk)):
                         complex_graphs.extend(t[0])
                         rdkit_ligands.extend(t[1])
                         pbar.update()
@@ -1037,17 +1060,16 @@ class PDBBindScoring(Dataset):
             for i in range(len(self.protein_path_list)//1000+1):
                 if os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
                     continue
+                names_chunk = self.name_list[1000 * i:1000 * (i + 1)]
                 protein_paths_chunk = self.protein_path_list[1000*i:1000*(i+1)]
                 ligand_description_chunk = self.ligand_descriptions[1000*i:1000*(i+1)]
-                ligands_chunk = ligands_list[1000 * i:1000 * (i + 1)]
-                lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
                 complex_graphs, rdkit_ligands = [], []
                 if self.num_workers > 1:
                     p = Pool(self.num_workers, maxtasksperchild=1)
                     p.__enter__()
                 with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i}/{len(protein_paths_chunk)//1000+1}') as pbar:
                     map_fn = p.imap_unordered if self.num_workers > 1 else map
-                    for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk)):
+                    for t in map_fn(self.get_complex, zip(names_chunk, protein_paths_chunk, ligand_description_chunk)):
                         complex_graphs.extend(t[0])
                         rdkit_ligands.extend(t[1])
                         pbar.update()

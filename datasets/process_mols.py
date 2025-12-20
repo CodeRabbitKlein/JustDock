@@ -553,6 +553,7 @@ def get_fullrec_graph(name, rec, rec_coords, c_alpha_coords, n_coords, c_coords,
     assert len(src_list) == len(dst_list)
 
     node_feat = rec_residue_featurizer(rec)
+    anchor_mask = torch.zeros((node_feat.shape[0], 1), dtype=torch.float32)
     mu_r_norm = torch.from_numpy(np.array(mean_norm_list).astype(np.float32))
     side_chain_vecs = torch.from_numpy(
         np.concatenate([np.expand_dims(n_rel_pos, axis=1), np.expand_dims(c_rel_pos, axis=1)], axis=1))
