@@ -691,7 +691,6 @@ class PDBBind(Dataset):
                     continue
                 protein_paths_chunk = self.protein_path_list[self.parallel_count*i:self.parallel_count*(i+1)]
                 ligand_description_chunk = self.ligand_descriptions[self.parallel_count*i:self.parallel_count*(i+1)]
-                ligands_chunk = ligands_list[self.parallel_count * i:self.parallel_count * (i + 1)]
                 lm_embeddings_chains = lm_embeddings_chains_all[self.parallel_count*i:self.parallel_count*(i+1)]
                 complex_graphs, rdkit_ligands = [], []
                 if self.num_workers > 1:
@@ -699,7 +698,7 @@ class PDBBind(Dataset):
                     p.__enter__()
                 with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i}/{len(protein_paths_chunk)//self.parallel_count+1}') as pbar:
                     map_fn = p.imap_unordered if self.num_workers > 1 else map
-                    for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk)):
+                    for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligand_description_chunk)):
                         complex_graphs.extend(t[0])
                         rdkit_ligands.extend(t[1])
                         pbar.update()
@@ -1061,17 +1060,16 @@ class PDBBindScoring(Dataset):
             for i in range(len(self.protein_path_list)//1000+1):
                 if os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
                     continue
+                names_chunk = self.name_list[1000 * i:1000 * (i + 1)]
                 protein_paths_chunk = self.protein_path_list[1000*i:1000*(i+1)]
                 ligand_description_chunk = self.ligand_descriptions[1000*i:1000*(i+1)]
-                ligands_chunk = ligands_list[1000 * i:1000 * (i + 1)]
-                lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
                 complex_graphs, rdkit_ligands = [], []
                 if self.num_workers > 1:
                     p = Pool(self.num_workers, maxtasksperchild=1)
                     p.__enter__()
                 with tqdm(total=len(protein_paths_chunk), desc=f'loading complexes {i}/{len(protein_paths_chunk)//1000+1}') as pbar:
                     map_fn = p.imap_unordered if self.num_workers > 1 else map
-                    for t in map_fn(self.get_complex, zip(protein_paths_chunk, lm_embeddings_chains, ligands_chunk,ligand_description_chunk)):
+                    for t in map_fn(self.get_complex, zip(names_chunk, protein_paths_chunk, ligand_description_chunk)):
                         complex_graphs.extend(t[0])
                         rdkit_ligands.extend(t[1])
                         pbar.update()
