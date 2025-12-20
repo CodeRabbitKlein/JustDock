@@ -5,6 +5,7 @@ import json
 import os
 import time
 from typing import Dict, List, Optional
+from collections import defaultdict
 
 import numpy as np
 from  scipy.spatial.transform import Rotation
