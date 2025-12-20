@@ -23,7 +23,7 @@ from utils.utils import save_yaml_file, get_optimizer_and_scheduler, get_model, 
 
 gpus = list(range(torch.cuda.device_count()))
 print('Available GPU count:',len(gpus))
-def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, start_epoch):
+def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, start_epoch, stage_scheduler=None):
     best_val_loss = math.inf
     best_val_inference_value = math.inf if args.inference_earlystop_goal == 'min' else 0
     best_epoch = 0
@@ -32,13 +32,14 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                       tor_weight=args.tor_weight, res_tr_weight=args.res_tr_weight, res_rot_weight=args.res_rot_weight, res_chi_weight=args.res_chi_weight,
                       no_torsion=args.no_torsion, clamp_value=args.loss_clamp)
 
-    stage_scales = [float(x) for x in args.stage_scales.split(',') if x]
-    stage_scheduler = AdaptiveStageScheduler(stage_scales=stage_scales,
-                                             min_batches=args.stage_min_batches,
-                                             cooldown_batches=args.stage_cooldown_batches,
-                                             plateau_tol=args.stage_plateau_tol,
-                                             exploration_prob=args.stage_exploration_prob,
-                                             warmup_batches=args.stage_warmup_batches)
+    if stage_scheduler is None:
+        stage_scales = [float(x) for x in args.stage_scales.split(',') if x]
+        stage_scheduler = AdaptiveStageScheduler(stage_scales=stage_scales,
+                                                 min_batches=args.stage_min_batches,
+                                                 cooldown_batches=args.stage_cooldown_batches,
+                                                 plateau_tol=args.stage_plateau_tol,
+                                                 exploration_prob=args.stage_exploration_prob,
+                                                 warmup_batches=args.stage_warmup_batches)
 
     print("Starting training...")
     print(f"Gradient clipping norm: {args.grad_clip_norm if args.grad_clip_norm is not None else 'None'} | "
@@ -197,6 +198,7 @@ def main_function():
     optimizer, scheduler = get_optimizer_and_scheduler(args, model, scheduler_mode=args.inference_earlystop_goal if args.val_inference_freq is not None else 'min')
     ema_weights = ExponentialMovingAverage(model.parameters(),decay=args.ema_rate)
     start_epoch = 0
+    stage_scheduler = None
     if args.restart_dir:
         load_log_path = os.path.join(args.restart_dir, 'load_state_warnings.log')
         try:
@@ -206,7 +208,14 @@ def main_function():
             load_state_dict_flexible(model.module if device.type == 'cuda' else model, dict['model'], strict=False, log_path=load_log_path)
             if hasattr(args, 'ema_rate'):
                 ema_weights.load_state_dict(dict['ema_weights'], device=device)
-            if 'stage_scheduler' in dict and 'stage_scheduler' in locals():
+            if 'stage_scheduler' in dict:
+                stage_scales = [float(x) for x in args.stage_scales.split(',') if x]
+                stage_scheduler = AdaptiveStageScheduler(stage_scales=stage_scales,
+                                                         min_batches=args.stage_min_batches,
+                                                         cooldown_batches=args.stage_cooldown_batches,
+                                                         plateau_tol=args.stage_plateau_tol,
+                                                         exploration_prob=args.stage_exploration_prob,
+                                                         warmup_batches=args.stage_warmup_batches)
                 stage_scheduler.load_state_dict(dict['stage_scheduler'])
                 print("Loaded stage scheduler state.")
             print("Restarting from epoch", dict['epoch'])
@@ -242,7 +251,7 @@ def main_function():
         save_yaml_file(yaml_file_name, args.__dict__)
     args.device = device
 
-    train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, start_epoch)
+    train(args, model, optimizer, scheduler, ema_weights, train_loader, val_loader, t_to_sigma, run_dir, start_epoch, stage_scheduler=stage_scheduler)
 
 
 if __name__ == '__main__':
