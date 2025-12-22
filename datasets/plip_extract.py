@@ -5,14 +5,12 @@ import warnings
 from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import numpy as np
-
 PLIP_CACHE_SCHEMA_VERSION = 2
 
+# Water bridges are intentionally omitted.
 DEFAULT_INTERACTION_TYPES: Sequence[str] = (
     "hydrophobic",
     "hbond",
-    "waterbridge",
     "saltbridge",
     "pistacking",
     "pication",
@@ -38,124 +36,237 @@ class PlipInteraction:
         return payload
 
 
-def _try_import_plip():
+def _coerce_int(value: str, default: Optional[int] = None) -> Optional[int]:
     try:
-        from plip.structure.preparation import PDBComplex  # type: ignore
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise ImportError(
-            "PLIP is required to extract interactions. Install with `pip install plip`."
-        ) from exc
-    return PDBComplex
+        return int(value)
+    except Exception:
+        return default
 
 
-def _extract_interactions_from_complex(complex_obj, pdbid: str) -> List[PlipInteraction]:
-    """Extract interactions from an analyzed PLIP complex."""
+def _coerce_float(value: str, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _split_atom_list(token: str) -> List[int]:
+    if token is None:
+        return []
+    return [int(x) for x in str(token).split(",") if str(x).strip().isdigit()]
+
+
+def _parse_rst_table(lines: List[str]) -> List[Dict[str, str]]:
+    """Parse a simple reStructuredText table emitted by PLIP txt reporter."""
+    rows: List[List[str]] = []
+    for line in lines:
+        line = line.rstrip("\n")
+        if not line.startswith("|"):
+            continue
+        # Drop first and last empty split from leading/trailing |
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if cells:
+            rows.append(cells)
+    if len(rows) < 2:
+        return []
+    headers = rows[0]
+    parsed: List[Dict[str, str]] = []
+    for row in rows[1:]:
+        # Pad/truncate to header length
+        adjusted = row + [""] * (len(headers) - len(row))
+        parsed.append(dict(zip(headers, adjusted)))
+    return parsed
+
+
+def _extract_section(lines: List[str], section_name: str) -> List[str]:
+    """Return table lines belonging to a section named by the bold heading."""
+    start_token = f"**{section_name}**"
+    collecting = False
+    buffer: List[str] = []
+    for line in lines:
+        if line.strip().startswith("**") and start_token not in line:
+            if collecting:
+                break
+        if start_token in line:
+            collecting = True
+            continue
+        if collecting:
+            buffer.append(line)
+    return buffer
+
+
+def _build_interactions(parsed_rows: List[Dict[str, str]], interaction_type: str) -> List[PlipInteraction]:
     interactions: List[PlipInteraction] = []
-    for ligand in complex_obj.ligands:
-        # Skip ligands that are not part of the requested pdbid
-        if ligand.hetid != pdbid and ligand.resnr != pdbid:
-            # PLIP stores the pdbid on each ligand for multi-ligand structures. If none
-            # match, we still continue because PDBBind entries are unique per structure.
-            pass
-        interaction_set = complex_obj.interaction_sets[ligand.uid]
-        # hydrophobic
-        for hphob in interaction_set.hydrophobic_contacts:
+    for row in parsed_rows:
+        if interaction_type == "hydrophobic":
+            lig_idx = _coerce_int(row.get("LIGCARBONIDX"), -1)
+            rec_res = _coerce_int(row.get("RESNR"), -1)
+            distance = _coerce_float(row.get("DIST"), 0.0)
             interactions.append(
                 PlipInteraction(
-                    lig_atom_idx=hphob.ligatom.idx,
-                    rec_residue_idx=hphob.resnr,
-                    interaction_type="hydrophobic",
-                    distance=float(hphob.dist),
+                    lig_atom_idx=lig_idx,
+                    rec_residue_idx=rec_res,
+                    interaction_type=interaction_type,
+                    distance=distance,
+                    angle=0.0,
+                    direction=(0.0, 0.0, 0.0),
                 )
             )
-        # hydrogen bonds
-        for hbond in interaction_set.hbonds_pdonor + interaction_set.hbonds_ldonor:
+        elif interaction_type == "hbond":
+            prot_is_don = row.get("PROTISDON", "False").lower() in ("true", "1")
+            donor_idx = _coerce_int(row.get("DONORIDX"), -1)
+            acceptor_idx = _coerce_int(row.get("ACCEPTORIDX"), -1)
+            lig_idx = acceptor_idx if prot_is_don else donor_idx
+            rec_res = _coerce_int(row.get("RESNR"), -1)
+            distance = _coerce_float(row.get("DIST_H-A"), 0.0)
+            angle = _coerce_float(row.get("DON_ANGLE"), 0.0)
             interactions.append(
                 PlipInteraction(
-                    lig_atom_idx=hbond.ligatom.idx,
-                    rec_residue_idx=hbond.resnr,
-                    interaction_type="hbond",
-                    distance=float(hbond.dist_h_a),
-                    angle=float(hbond.angle if hasattr(hbond, "angle") else 0.0),
-                    direction=tuple(np.array(hbond.normvec) if hasattr(hbond, "normvec") else np.zeros(3)),
+                    lig_atom_idx=lig_idx,
+                    rec_residue_idx=rec_res,
+                    interaction_type=interaction_type,
+                    distance=distance,
+                    angle=angle,
+                    direction=(0.0, 0.0, 0.0),
                 )
             )
-        # salt bridges
-        for salt in interaction_set.saltbridge_lneg + interaction_set.saltbridge_lpos:
+        elif interaction_type == "saltbridge":
+            lig_list = _split_atom_list(row.get("LIG_IDX_LIST"))
+            lig_idx = lig_list[0] if lig_list else -1
+            rec_res = _coerce_int(row.get("RESNR"), -1)
+            distance = _coerce_float(row.get("DIST"), 0.0)
             interactions.append(
                 PlipInteraction(
-                    lig_atom_idx=salt.ligatom.idx,
-                    rec_residue_idx=salt.resnr,
-                    interaction_type="saltbridge",
-                    distance=float(salt.dist),
+                    lig_atom_idx=lig_idx,
+                    rec_residue_idx=rec_res,
+                    interaction_type=interaction_type,
+                    distance=distance,
+                    angle=0.0,
+                    direction=(0.0, 0.0, 0.0),
                 )
             )
-        # pi interactions
-        for stack in interaction_set.pistacking:
+        elif interaction_type == "pistacking":
+            lig_list = _split_atom_list(row.get("LIG_IDX_LIST"))
+            lig_idx = lig_list[0] if lig_list else -1
+            rec_res = _coerce_int(row.get("RESNR"), -1)
+            distance = _coerce_float(row.get("CENTDIST"), 0.0)
+            angle = _coerce_float(row.get("ANGLE"), 0.0)
             interactions.append(
                 PlipInteraction(
-                    lig_atom_idx=stack.ligatom.idx,
-                    rec_residue_idx=stack.resnr,
-                    interaction_type="pistacking",
-                    distance=float(stack.distance),
-                    angle=float(stack.angle if hasattr(stack, "angle") else 0.0),
-                    direction=tuple(np.array(stack.nvec) if hasattr(stack, "nvec") else np.zeros(3)),
+                    lig_atom_idx=lig_idx,
+                    rec_residue_idx=rec_res,
+                    interaction_type=interaction_type,
+                    distance=distance,
+                    angle=angle,
+                    direction=(0.0, 0.0, 0.0),
                 )
             )
-        for cat in interaction_set.pication_laro + interaction_set.pication_paro:
+        elif interaction_type == "pication":
+            lig_list = _split_atom_list(row.get("LIG_IDX_LIST"))
+            lig_idx = lig_list[0] if lig_list else -1
+            rec_res = _coerce_int(row.get("RESNR"), -1)
+            distance = _coerce_float(row.get("DIST"), 0.0)
+            angle = 0.0
             interactions.append(
                 PlipInteraction(
-                    lig_atom_idx=cat.ligatom.idx,
-                    rec_residue_idx=cat.resnr,
-                    interaction_type="pication",
-                    distance=float(cat.distance),
-                    angle=float(cat.angle if hasattr(cat, "angle") else 0.0),
-                    direction=tuple(np.array(cat.vec) if hasattr(cat, "vec") else np.zeros(3)),
+                    lig_atom_idx=lig_idx,
+                    rec_residue_idx=rec_res,
+                    interaction_type=interaction_type,
+                    distance=distance,
+                    angle=angle,
+                    direction=(0.0, 0.0, 0.0),
                 )
             )
-        # halogens
-        for hal in interaction_set.halogen_bonds:
+        elif interaction_type == "halogen":
+            lig_idx = _coerce_int(row.get("DON_IDX") or row.get("ACC_IDX"), -1)
+            rec_res = _coerce_int(row.get("RESNR"), -1)
+            distance = _coerce_float(row.get("DIST"), 0.0)
+            angle = _coerce_float(row.get("DON_ANGLE") or row.get("ACC_ANGLE"), 0.0)
             interactions.append(
                 PlipInteraction(
-                    lig_atom_idx=hal.ligatom.idx,
-                    rec_residue_idx=hal.resnr,
-                    interaction_type="halogen",
-                    distance=float(hal.dist),
-                    angle=float(hal.angle if hasattr(hal, "angle") else 0.0),
-                    direction=tuple(np.array(hal.vec) if hasattr(hal, "vec") else np.zeros(3)),
+                    lig_atom_idx=lig_idx,
+                    rec_residue_idx=rec_res,
+                    interaction_type=interaction_type,
+                    distance=distance,
+                    angle=angle,
+                    direction=(0.0, 0.0, 0.0),
                 )
             )
-        # metal
-        for metal in interaction_set.metals:
+        elif interaction_type == "metal":
+            lig_idx = _coerce_int(row.get("TARGET_IDX"), -1)
+            rec_res = _coerce_int(row.get("RESNR"), -1)
+            distance = _coerce_float(row.get("DIST"), 0.0)
             interactions.append(
                 PlipInteraction(
-                    lig_atom_idx=metal.ligatom.idx,
-                    rec_residue_idx=metal.resnr,
-                    interaction_type="metal",
-                    distance=float(metal.dist),
+                    lig_atom_idx=lig_idx,
+                    rec_residue_idx=rec_res,
+                    interaction_type=interaction_type,
+                    distance=distance,
+                    angle=0.0,
+                    direction=(0.0, 0.0, 0.0),
                 )
             )
     return interactions
 
 
+def parse_plip_txt(txt_path: str, pdbid: str) -> List[PlipInteraction]:
+    """Parse a PLIP-generated txt report into a list of PlipInteraction."""
+    with open(txt_path, "r") as f:
+        lines = f.readlines()
+
+    interactions: List[PlipInteraction] = []
+    section_mapping = {
+        "Hydrophobic Interactions": "hydrophobic",
+        "Hydrogen Bonds": "hbond",
+        "Salt Bridges": "saltbridge",
+        "pi-Stacking": "pistacking",
+        "pi-Cation Interactions": "pication",
+        "Halogen Bonds": "halogen",
+        "Metal Complexes": "metal",
+    }
+
+    for section_label, interaction_type in section_mapping.items():
+        table_lines = _extract_section(lines, section_label)
+        parsed_rows = _parse_rst_table(table_lines)
+        if not parsed_rows:
+            continue
+        interactions.extend(_build_interactions(parsed_rows, interaction_type))
+
+    return interactions
+
+
+def _resolve_txt_path(structure_path: str, pdbid: str) -> Optional[str]:
+    """Infer the txt report path from a provided path (txt or pdb)."""
+    if os.path.isfile(structure_path) and structure_path.lower().endswith(".txt"):
+        return structure_path
+    candidate_dir = structure_path
+    if os.path.isfile(structure_path):
+        candidate_dir = os.path.dirname(structure_path)
+    for filename in (f"{pdbid}.txt", f"{pdbid}_report.txt", f"{pdbid}_plip.txt"):
+        candidate = os.path.join(candidate_dir, filename)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def extract_plip_interactions(
-    pdb_path: str,
+    structure_path: str,
     pdbid: str,
     output_dir: str,
     overwrite: bool = False,
 ) -> str:
-    """Run PLIP on a complex file and cache the interaction JSON.
+    """Parse a PLIP txt report and cache the interaction JSON.
 
     Parameters
     ----------
-    pdb_path : str
-        Path to a prepared complex structure containing both receptor and ligand.
+    structure_path : str
+        Path to a PLIP txt report or a directory containing ``<pdbid>.txt``.
     pdbid : str
         Identifier used to name the cache file.
     output_dir : str
         Directory used to store the cached interaction JSON files.
     overwrite : bool
-        If True, rerun PLIP even when a cache file exists.
+        If True, re-parse even when a cache file exists.
 
     Returns
     -------
@@ -167,12 +278,11 @@ def extract_plip_interactions(
     if os.path.exists(output_path) and not overwrite:
         return output_path
 
-    PDBComplex = _try_import_plip()
-    complex_obj = PDBComplex()
-    complex_obj.load_pdb(pdb_path)
-    complex_obj.analyze()
-    interactions = _extract_interactions_from_complex(complex_obj, pdbid)
+    txt_path = _resolve_txt_path(structure_path, pdbid)
+    if txt_path is None:
+        raise FileNotFoundError(f"Could not find PLIP txt report for {pdbid} near {structure_path}")
 
+    interactions = parse_plip_txt(txt_path, pdbid)
     payload = {
         "pdbid": pdbid,
         "num_interactions": len(interactions),
@@ -186,16 +296,7 @@ def extract_plip_interactions(
 
 
 def load_plip_cache(pdbid: str, cache_dir: str) -> Optional[Dict]:
-    """Load a cached PLIP result.
-
-    Returns
-    -------
-    Optional[Dict]
-        Cache payload with normalized fields. A ``_schema_mismatch`` flag is
-        injected when the on-disk schema version does not match the current
-        :data:`PLIP_CACHE_SCHEMA_VERSION` so that callers can decide whether to
-        fall back to a non-PLIP path.
-    """
+    """Load a cached PLIP result."""
     cache_path_json = os.path.join(cache_dir, f"{pdbid}_interactions.json")
     cache_path_pkl = os.path.join(cache_dir, f"{pdbid}_interactions.pkl")
     if os.path.exists(cache_path_json):
@@ -225,26 +326,26 @@ def load_plip_cache(pdbid: str, cache_dir: str) -> Optional[Dict]:
 
 
 def batch_extract(
-    pdb_dir: str,
+    txt_dir: str,
     pdb_ids: Iterable[str],
     output_dir: str = "data/cache_plip",
     overwrite: bool = False,
 ) -> None:
-    """Batch run PLIP over a collection of complexes."""
+    """Batch parse PLIP txt reports for a collection of complexes."""
     failures: List[str] = []
     for pdbid in pdb_ids:
-        pdb_path = os.path.join(pdb_dir, pdbid, f"{pdbid}.pdb")
-        if not os.path.exists(pdb_path):
-            warnings.warn(f"Skipping {pdbid}: structure file not found at {pdb_path}")
+        txt_path = os.path.join(txt_dir, f"{pdbid}.txt")
+        if not os.path.exists(txt_path):
+            warnings.warn(f"Skipping {pdbid}: txt report not found at {txt_path}")
             failures.append(pdbid)
             continue
         try:
-            extract_plip_interactions(pdb_path, pdbid, output_dir, overwrite=overwrite)
+            extract_plip_interactions(txt_path, pdbid, output_dir, overwrite=overwrite)
         except Exception as exc:  # pragma: no cover - logging only
-            warnings.warn(f"PLIP failed on {pdbid}: {exc}")
+            warnings.warn(f"PLIP txt parsing failed on {pdbid}: {exc}")
             failures.append(pdbid)
     if failures:
-        sys.stderr.write(f"PLIP extraction failed for {len(failures)} complexes: {', '.join(failures)}\n")
+        sys.stderr.write(f"PLIP txt parsing failed for {len(failures)} complexes: {', '.join(failures)}\n")
 
 
 __all__ = [
@@ -254,4 +355,5 @@ __all__ = [
     "batch_extract",
     "extract_plip_interactions",
     "load_plip_cache",
+    "parse_plip_txt",
 ]
